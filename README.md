@@ -103,9 +103,16 @@ Current state: **45 tests**, zero false positives across 113 real transcripts, a
 caught — take a real session that legitimately claimed a passing suite, remove the test command from
 its observations, and require the checker to notice.
 
+The 45 tests are the reproducible part, and they are what CI runs on every push:
+
 ```bash
 python3 tests/test_claim_check.py
 ```
+
+The transcript numbers are not reproducible by anyone else: they come from private local sessions
+that cannot be shared. Treat them as a statement about how this was developed, not as evidence you
+can check. If you point it at your own transcripts and it gets something wrong, that is a bug report
+worth more than the number.
 
 ## Enforce mode (off by default)
 
