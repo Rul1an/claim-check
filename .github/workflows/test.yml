@@ -1,0 +1,58 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests
+        run: python3 tests/test_claim_check.py
+
+  validate:
+    name: validate plugin manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JSON is parseable
+        run: |
+          python3 -c "import json;json.load(open('.claude-plugin/plugin.json'))"
+          python3 -c "import json;json.load(open('.claude-plugin/marketplace.json'))"
+          python3 -c "import json;json.load(open('hooks/hooks.json'))"
+      - name: Manifest version matches the script
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys
+          man = json.load(open('.claude-plugin/plugin.json'))['version']
+          mkt = json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version']
+          assert man == mkt, f"plugin.json {man} != marketplace.json {mkt}"
+          sys.path.insert(0, 'scripts')
+          import claim_check
+          assert claim_check.VERSION.startswith(man + "+"), claim_check.VERSION
+          print("version consistent:", claim_check.VERSION)
+          PY
+      - name: Hook never breaks a session on hostile input
+        run: |
+          for payload in '' 'not json' '{}' '{"transcript_path":"/nope.jsonl"}'; do
+            printf '%s' "$payload" | python3 scripts/claim_check.py > /dev/null
+            code=$?
+            if [ "$code" -ne 0 ]; then echo "exit $code on payload: $payload"; exit 1; fi
+          done
+          echo "all hostile inputs exit 0"

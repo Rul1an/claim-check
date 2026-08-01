@@ -1,0 +1,17 @@
+{
+  "description": "At the end of a turn, compare the agent's claims against what the session observed.",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claim_check.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "claim-check",
+  "version": "0.2.0",
+  "description": "Tells you when the agent said it ran the tests and no test ran. Compares the claims in the final message against what the session actually observed.",
+  "author": {
+    "name": "Assay"
+  },
+  "keywords": [
+    "verification",
+    "testing",
+    "hooks",
+    "agent-claims"
+  ],
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Rul1an/assay"
+}
