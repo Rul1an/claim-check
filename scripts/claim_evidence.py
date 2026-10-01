@@ -320,6 +320,12 @@ def _assess_receipt(claim: dict, receipt: dict, check_current: Callable[[str, li
     view, event_reasons = _read_events(report.get("events"))
     if report["present"]:
         reasons.extend(event_reasons)
+    if process["timed_out"]:
+        reasons.append("timed_out")
+    if not process["completed"]:
+        reasons.append("process_not_completed")
+    if process["signal"] is not None:
+        reasons.append("killed_by_signal")
     if not declared["pre"]:
         reasons.append("declared_scope_empty")
     if declared["pre"] != declared["post"]:
@@ -348,14 +354,8 @@ def _assess_receipt(claim: dict, receipt: dict, check_current: Callable[[str, li
     if reasons:
         return "insufficient", reasons, scope
 
-    if process["timed_out"]:
-        reasons.append("timed_out")
-    if not process["completed"]:
-        reasons.append("process_not_completed")
-    if process["signal"] is not None:
-        reasons.append("killed_by_signal")
     exit_code = process["exit_code"]
-    if not reasons and view["exitstatus"] != exit_code:
+    if view["exitstatus"] != exit_code:
         reasons.append("exit_status_mismatch")
     if view["collect_errors"]:
         reasons.append("collection_error")

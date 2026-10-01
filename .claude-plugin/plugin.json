@@ -1,7 +1,7 @@
 {
   "name": "claim-check",
-  "version": "0.2.0",
-  "description": "Tells you when the agent said it ran the tests and no test ran. Compares the claims in the final message against what the session actually observed.",
+  "version": "0.3.0",
+  "description": "Says what the session transcript can and cannot show about the claims in the agent's final message, and checks a scoped test claim against an opt-in pytest receipt.",
   "author": {
     "name": "Assay"
   },
