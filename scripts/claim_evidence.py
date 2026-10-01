@@ -43,6 +43,9 @@ KINDS = (KIND_RECORDED, KIND_CURRENT)
 
 MAX_DECLARED_FILE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 16 * 1024 * 1024
+# A receipt nests five levels (receipt, report, events, one event, its node ids).
+# Anything deeper than this is not a receipt, a claim or a report line.
+MAX_JSON_DEPTH = 16
 
 EXIT_CODES = {"supported": 0, "contradicted": 1, "insufficient": 2, "unchecked": 3}
 EXIT_USAGE = 64
@@ -85,12 +88,30 @@ def _is_number(x: Any) -> bool:
     return type(x) in (int, float) and x == x and x not in (float("inf"), float("-inf"))
 
 
+def depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
+    """True when no list or dict in `value` sits more than `limit` levels deep.
+
+    Walks with its own stack. How deep the JSON decoder or encoder can recurse
+    differs between Python versions, so the limit is stated here and not left to them.
+    """
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if type(item) in (list, dict):
+            if depth > limit:
+                return False
+            children = item.values() if type(item) is dict else item
+            stack.extend((child, depth + 1) for child in children)
+    return True
+
+
 def loads_strict(text: str) -> Any:
     """json.loads, refusing input that would hide a conflict or is not JSON.
 
     A repeated key is two statements about one member; json.loads keeps the last
-    and drops the other without a trace. NaN and infinities are not JSON.
-    Raises ValueError, or RecursionError on input nested too deeply to decode.
+    and drops the other without a trace. NaN and infinities are not JSON. Nesting
+    beyond MAX_JSON_DEPTH is refused whether or not the decoder got through it.
+    Raises ValueError, or RecursionError where the decoder did not get through.
     """
 
     def pairs(items: list) -> dict:
@@ -110,7 +131,10 @@ def loads_strict(text: str) -> Any:
             raise ValueError("not a finite number")
         return value
 
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
+    value = json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
+    if not depth_ok(value):
+        raise ValueError("nested too deeply")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +510,8 @@ def assess(claim: Any, receipts: list, *, check_current: Callable[[str, list[str
     reasons: list[str] = []
     matching: dict[str, dict] = {}
     for receipt in receipts:
-        if type(receipt) is not dict:
+        # Depth first: hashing or printing a deeper value can exhaust the interpreter's stack.
+        if type(receipt) is not dict or not depth_ok(receipt):
             reasons.append("unreadable_receipt")
         elif not _is_str(receipt.get("run_id")):
             reasons.append("malformed_receipt")

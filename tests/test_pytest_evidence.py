@@ -43,8 +43,8 @@ class TestReportReading(unittest.TestCase):
 
     def read(self, text, limit=10**6):
         import pytest_evidence as pe
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as fh:
-            fh.write(text)
+        with tempfile.NamedTemporaryFile("wb", suffix=".jsonl", delete=False) as fh:
+            fh.write(text if isinstance(text, bytes) else text.encode("utf-8"))
             path = fh.name
         try:
             return pe._read_report(path, limit)
@@ -60,6 +60,24 @@ class TestReportReading(unittest.TestCase):
     def test_lines_that_cannot_be_decoded_are_counted(self):
         report = self.read("{ not json\n" + "[" * 100000 + "]" * 100000 + '\n{"x": NaN}\n')
         self.assertEqual((report["malformed_lines"], report["events"]), (3, []))
+
+    def test_a_line_with_a_damaged_byte_is_malformed_and_is_not_repaired(self):
+        """Decoding with replacement turned a broken byte into U+FFFD and kept the line."""
+        good = b'{"event": "session_finish", "exitstatus": 0}\n'
+        bad = b'{"event": "session_start", "pytest_version": "9.\xff1"}\n'
+        report = self.read(bad + good)
+        self.assertEqual((report["malformed_lines"], report["events"]),
+                         (1, [{"event": "session_finish", "exitstatus": 0}]))
+
+    def test_a_line_nested_deeper_than_any_report_event_is_malformed(self):
+        """1,500 levels decode on Python 3.12 and then break serialisation of the receipt."""
+        for depth in (1500, 40):
+            line = '{"event": "deselected", "nodeids": ' + "[" * depth + "]" * depth + "}\n"
+            report = self.read(line)
+            self.assertEqual((report["malformed_lines"], report["events"]), (1, []), depth)
+            json.dumps(report)
+        ok = self.read('{"event": "deselected", "nodeids": ["a", "b"]}\n')
+        self.assertEqual(ok["malformed_lines"], 0)
 
     def test_a_missing_report_is_not_present(self):
         import pytest_evidence as pe
@@ -222,6 +240,31 @@ class TestCompletionComesFromTheParent(RunnerCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(verdict, "insufficient")
         self.assertIn("report_not_finished", reasons)
+
+
+class TestHostileReportLines(RunnerCase):
+    """Lines the capture plugin would never write, appended to the report by code in the child."""
+
+    def run_with_extra_line(self, line_expr):
+        self.write("test_ok.py", PASSING)
+        self.write("conftest.py", "import os\n\ndef pytest_sessionstart(session):\n"
+                                  "    with open(os.environ['CLAIM_CHECK_REPORT_PATH'], 'ab') as fh:\n"
+                                  "        fh.write(" + line_expr + ")\n")
+        proc, summary, receipt = self.run_runner(["-q", "test_ok.py"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(summary, "the runner must still write a receipt and its summary line")
+        out = self.assess(summary, receipt)
+        return receipt, out
+
+    def test_a_deeply_nested_line_still_yields_a_receipt_and_is_insufficient(self):
+        receipt, out = self.run_with_extra_line("b'{\"event\": \"deselected\", \"nodeids\": ' + b'[' * 1500 + b']' * 1500 + b'}\\n'")
+        self.assertEqual(receipt["report"]["malformed_lines"], 1)
+        self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["report_malformed_lines"]))
+
+    def test_a_line_with_a_damaged_byte_is_insufficient(self):
+        receipt, out = self.run_with_extra_line("b'{\"event\": \"deselected\", \"nodeids\": [\"a\\xffb\"]}\\n'")
+        self.assertEqual(receipt["report"]["malformed_lines"], 1)
+        self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["report_malformed_lines"]))
 
 
 class TestDeclaredFiles(RunnerCase):

@@ -479,6 +479,32 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual((proc.returncode, proc.stderr), (2, ""), raw[:30])
             self.assertEqual(json.loads(proc.stdout)["reasons"], ["unreadable_receipt"])
 
+    def test_input_nested_deeper_than_any_receipt_is_unreadable_on_every_interpreter(self):
+        """1,500 levels decode on Python 3.12; the limit is on depth, not on what the decoder survives."""
+        for depth in (1500, 40):
+            deep = '{"run_id":"run-0001","nested":' + "[" * depth + "0" + "]" * depth + "}"
+            proc = self.run_cli(claim(), [deep])
+            self.assertEqual((proc.returncode, proc.stderr), (2, ""), depth)
+            self.assertEqual(json.loads(proc.stdout)["reasons"], ["unreadable_receipt"])
+        nested = []
+        for _ in range(1500):
+            nested = [nested]
+        for bad in (dict(passing_receipt(), extra=nested), nested):
+            out = ce.assess(claim(), [bad])
+            self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["unreadable_receipt"]))
+
+    def test_a_receipt_with_a_damaged_byte_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            c, r = os.path.join(tmp, "c.json"), os.path.join(tmp, "r.json")
+            with open(c, "w", encoding="utf-8") as fh:
+                json.dump(claim(), fh)
+            with open(r, "wb") as fh:
+                fh.write(json.dumps(passing_receipt()).encode("utf-8").replace(b'"9.1.1"', b'"9.\xff1"'))
+            proc = subprocess.run([sys.executable, SCRIPT, "assess", "--claim", c, "--receipt", r],
+                                  capture_output=True, text=True)
+            self.assertEqual((proc.returncode, proc.stderr), (2, ""))
+            self.assertEqual(json.loads(proc.stdout)["reasons"], ["unreadable_receipt"])
+
     def test_unusable_invocations_exit_64_and_print_no_verdict(self):
         proc = self.run_cli(None, [passing_receipt()], raw_claim="{ not json")
         self.assertEqual((proc.returncode, proc.stdout), (64, ""))

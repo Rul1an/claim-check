@@ -115,13 +115,15 @@ def _read_report(path, max_bytes):
         # A cut report is not a shorter report. Nothing from it is kept.
         return {"present": True, "truncated": True, "malformed_lines": 0, "events": []}
     events, malformed = [], 0
-    for line in data.decode("utf-8", "replace").splitlines():
-        if not line.strip():
+    for raw in data.split(b"\n"):
+        if not raw.strip():
             continue
         try:
-            # Strict: a line that states one key twice is counted as malformed, so the
-            # conflict is still visible when the receipt is assessed.
-            events.append(ce.loads_strict(line))
+            # Strict, line by line. A damaged byte is not repaired, a key stated twice is
+            # not resolved, and nesting past the limit is not kept: each is counted as
+            # malformed, so it is still visible when the receipt is assessed and nothing
+            # that could break serialising the receipt gets into it.
+            events.append(ce.loads_strict(raw.decode("utf-8")))
         except (ValueError, RecursionError):
             malformed += 1
     return {"present": True, "truncated": False, "malformed_lines": malformed, "events": events}
@@ -235,10 +237,15 @@ def run(receipt_dir, declare, pytest_args, timeout, max_output_bytes, max_report
 
     path = os.path.join(receipt_dir, run_id + ".json")
     try:
+        # Serialised in full before the file exists, so a failure leaves no partial receipt.
+        text = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+    except (ValueError, RecursionError):
+        sys.stderr.write("cannot serialise the receipt\n")
+        return EXIT_INTERNAL
+    try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(receipt, fh, indent=2, sort_keys=True)
-            fh.write("\n")
+            fh.write(text)
     except OSError as exc:
         sys.stderr.write(f"cannot write the receipt: {exc.strerror}\n")
         return EXIT_INTERNAL

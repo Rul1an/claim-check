@@ -152,7 +152,7 @@ launch argv, working directory and declared paths present and well-formed.
 Everything else is `insufficient`, with reason codes: no tests collected, a skip, an xfail, a
 collection error, a timeout, a missing or cut report, an unknown, repeated or mistyped report
 line, a repeated, missing or out-of-order phase, a key stated twice in a receipt or a report line,
-input that cannot be decoded, an exit status that differs from the process exit code, a
+input that is not valid UTF-8 JSON or nests more than 16 levels, an exit status that differs from the process exit code, a
 different run, selection or declared-file identity, a declared file that changed, went missing or
 became a symlink. Two different receipts for the same run are both listed and neither is used.
 
