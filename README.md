@@ -14,15 +14,16 @@ A Claude Code plugin with two separate parts:
 claim-check — what the final message claims, and what this transcript can show
 
   insufficient  All tests pass
-                1 tool request naming a test runner was seen. A request is not a result:
-                this transcript holds no exit code, report or effect.
+                1 tool request naming a test runner was seen. A request is not a result,
+                and this hook does not evaluate tool results: nothing here binds an exit
+                code or a report to the claim.
   unchecked     claimed a commit
                 no shell-tool request was seen. That does not show it did not happen:
                 hooks, subagents, scripts and your own shell are not in view.
 
-  note: claim-check reads tool requests in the transcript, not their results or effects.
-        It cannot confirm or refute a claim. The labels above describe what was
-        checkable here, not whether the claim is true.
+  note: claim-check counts tool requests in the transcript. It does not evaluate their
+        results or effects. It cannot confirm or refute a claim. The labels above
+        describe what was checkable here, not whether the claim is true.
 ```
 
 ## Install
@@ -63,8 +64,9 @@ claims in prose is heuristic; what it says about each claim is fixed by rule.
 | "I committed", "I pushed" | `unchecked` | how many shell-tool requests were seen; their text is not read |
 | "I updated `path`", "I did not touch `path`" | `unchecked` | how many editing-tool requests named a path ending in `path` |
 
-A transcript holds tool *requests*. It does not hold exit codes, test reports or effects, and it
-does not hold what a hook, a subagent, a script or your own shell did. So:
+The hook counts tool *requests*. It does not evaluate tool results, even where the transcript
+carries an exit code or a test summary: nothing in the hook binds such a result to a claim. And a
+transcript does not show what a hook, a subagent, a script or your own shell did. So:
 
 - A request that was seen does not confirm anything. `echo pytest` names a test runner.
 - A request that was not seen does not refute anything. Tests can run where the hook cannot look.
@@ -140,15 +142,17 @@ Two claim kinds:
 
 `supported` needs all of this: one receipt for the run; run id, selection digest and declared-file
 digest equal to the claim's; the process completed with exit code 0 and pytest's own exit status
-agrees; exactly one session start, one selection and one session finish, in order; at least one
-selected item; every selected item with setup, call and teardown recorded once each as passed; no
-skip, xfail or xpass; no collection error.
+agrees; exactly one session start, one selection and one session finish, with the selection before
+any test phase; at least one selected item; every selected item with setup, call and teardown
+recorded once each, in that order, as passed; no skip, xfail or xpass; no collection error; the
+launch argv, working directory and declared paths present and well-formed.
 
 `contradicted` needs the same binding, exit code 1, and a selected item with a failed phase.
 
 Everything else is `insufficient`, with reason codes: no tests collected, a skip, an xfail, a
 collection error, a timeout, a missing or cut report, an unknown, repeated or mistyped report
-line, a repeated or missing phase, an exit status that differs from the process exit code, a
+line, a repeated, missing or out-of-order phase, a key stated twice in a receipt or a report line,
+input that cannot be decoded, an exit status that differs from the process exit code, a
 different run, selection or declared-file identity, a declared file that changed, went missing or
 became a symlink. Two different receipts for the same run are both listed and neither is used.
 

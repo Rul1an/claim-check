@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import stat
 import sys
@@ -80,6 +81,38 @@ def _is_str_list(x: Any) -> bool:
     return type(x) is list and all(type(i) is str for i in x)
 
 
+def _is_number(x: Any) -> bool:
+    return type(x) in (int, float) and x == x and x not in (float("inf"), float("-inf"))
+
+
+def loads_strict(text: str) -> Any:
+    """json.loads, refusing input that would hide a conflict or is not JSON.
+
+    A repeated key is two statements about one member; json.loads keeps the last
+    and drops the other without a trace. NaN and infinities are not JSON.
+    Raises ValueError, or RecursionError on input nested too deeply to decode.
+    """
+
+    def pairs(items: list) -> dict:
+        out: dict = {}
+        for key, value in items:
+            if key in out:
+                raise ValueError("repeated key")
+            out[key] = value
+        return out
+
+    def constant(name: str) -> Any:
+        raise ValueError("not a JSON number")
+
+    def number(literal: str) -> float:
+        value = float(literal)
+        if not _is_number(value):
+            raise ValueError("not a finite number")
+        return value
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
+
+
 # ---------------------------------------------------------------------------
 # Digests
 # ---------------------------------------------------------------------------
@@ -116,22 +149,36 @@ class DeclaredFileError(Exception):
     """A declared file cannot be snapshotted safely. The message names why."""
 
 
+def declared_path_ok(path: Any) -> bool:
+    """Structural only, no filesystem: a relative POSIX path that stays under its base."""
+    return (
+        _is_str(path) and path != "" and "\x00" not in path and "\\" not in path
+        and not path.startswith("/") and all(part not in ("", ".", "..") for part in path.split("/"))
+    )
+
+
+def cwd_ok(cwd: Any) -> bool:
+    """Structural only, no filesystem: an absolute POSIX path already in normal form."""
+    return (
+        _is_str(cwd) and cwd.startswith("/") and not cwd.startswith("//")
+        and "\x00" not in cwd and posixpath.normpath(cwd) == cwd
+    )
+
+
 def snapshot_declared(cwd: str, paths: list[str]) -> list[dict]:
     """Read each declared file under `cwd` and return path, sha256 and size.
 
     Refuses anything whose identity is ambiguous: an absolute path, a `..`, a
     duplicate, a symlink at any component below `cwd`, or a non-regular file.
     """
-    if not _is_str(cwd) or not os.path.isabs(cwd) or os.path.realpath(cwd) != cwd:
-        raise DeclaredFileError("cwd is not an absolute path free of symlinks")
+    if not cwd_ok(cwd) or os.path.realpath(cwd) != cwd:
+        raise DeclaredFileError("cwd is not an absolute, normal path free of symlinks")
     seen: set[str] = set()
     out: list[dict] = []
     for raw in paths:
-        if not _is_str(raw) or not raw or "\\" in raw or raw.startswith("/"):
-            raise DeclaredFileError("declared path is not a relative POSIX path")
+        if not declared_path_ok(raw):
+            raise DeclaredFileError("declared path is not a relative POSIX path that stays under cwd")
         parts = raw.split("/")
-        if any(p in ("", ".", "..") for p in parts):
-            raise DeclaredFileError("declared path has an empty, `.` or `..` component")
         if raw in seen:
             raise DeclaredFileError("declared path is listed twice")
         seen.add(raw)
@@ -140,7 +187,7 @@ def snapshot_declared(cwd: str, paths: list[str]) -> list[dict]:
             current = os.path.join(current, part)
             try:
                 st = os.lstat(current)
-            except OSError:
+            except (OSError, ValueError):
                 raise DeclaredFileError("declared file is missing") from None
             if stat.S_ISLNK(st.st_mode):
                 raise DeclaredFileError("declared path crosses a symlink")
@@ -175,7 +222,7 @@ def _declared_entries_ok(entries: Any) -> bool:
     for e in entries:
         if type(e) is not dict or set(e) != {"path", "sha256", "size"}:
             return False
-        if not _is_str(e["path"]) or not _is_str(e["sha256"]) or not _HEX64.match(e["sha256"]):
+        if not declared_path_ok(e["path"]) or not _is_str(e["sha256"]) or not _HEX64.match(e["sha256"]):
             return False
         if not _is_int(e["size"]) or e["size"] < 0:
             return False
@@ -246,7 +293,9 @@ def _read_events(events: Any) -> tuple[dict, list[str]]:
             reasons.append("duplicate_report_event")
     if reasons:
         return view, _unique(reasons)
-    if names[0] != "session_start" or names[-1] != "session_finish":
+    # pytest collects before it runs anything, so the selection precedes every phase.
+    first_phase = names.index("phase") if "phase" in names else len(names)
+    if names[0] != "session_start" or names[-1] != "session_finish" or names.index("selected") > first_phase:
         return view, ["report_out_of_order"]
 
     for e in events:
@@ -273,6 +322,14 @@ def _read_events(events: Any) -> tuple[dict, list[str]]:
         if e["when"] in phases:
             reasons.append("repeated_phase")
             continue
+        # One item runs setup, then call only after a setup that passed, then teardown.
+        position = _PHASES.index(e["when"])
+        if (
+            any(_PHASES.index(w) > position for w in phases)
+            or (position > 0 and "setup" not in phases)
+            or (e["when"] == "call" and phases["setup"][0] != "passed")
+        ):
+            reasons.append("phase_out_of_order")
         phases[e["when"]] = (e["outcome"], e["xfail"])
     return view, _unique(reasons)
 
@@ -296,12 +353,18 @@ def _assess_receipt(claim: dict, receipt: dict, check_current: Callable[[str, li
         return "insufficient", ["unsupported_schema"], scope
 
     process, report, declared = receipt.get("process"), receipt.get("report"), receipt.get("declared_files")
+    argv = receipt.get("argv")
     well_typed = (
-        _is_str(receipt.get("cwd"))
+        cwd_ok(receipt.get("cwd"))
+        # The runner starts exactly this: an interpreter, then pytest with the capture plugin.
+        and _is_str_list(argv) and len(argv) >= 5 and argv[0] != ""
+        and argv[1:5] == ["-m", "pytest", "-p", "pytest_capture"]
+        and _is_str_list(receipt.get("env_names_present"))
         and type(process) is dict and type(report) is dict and type(declared) is dict
         and _is_bool(process.get("completed")) and _is_bool(process.get("timed_out"))
         and (process.get("exit_code") is None or _is_int(process.get("exit_code")))
         and (process.get("signal") is None or _is_int(process.get("signal")))
+        and all(_is_number(process.get(k)) for k in ("started_at", "ended_at", "timeout_seconds"))
         and _is_bool(report.get("present")) and _is_bool(report.get("truncated"))
         and _is_int(report.get("malformed_lines"))
         and _declared_entries_ok(declared.get("pre")) and _declared_entries_ok(declared.get("post"))
@@ -447,14 +510,15 @@ def assess(claim: Any, receipts: list, *, check_current: Callable[[str, list[str
 
 
 def _load_json(path: str) -> Any:
-    """Parsed JSON, or None when the file is unreadable, too large or not JSON."""
+    """Parsed JSON, or None when the file is unreadable, too large, not JSON, nested too
+    deeply to decode, or states one key twice."""
     try:
         with open(path, "rb") as fh:
             data = fh.read(MAX_INPUT_BYTES + 1)
         if len(data) > MAX_INPUT_BYTES:
             return None
-        return json.loads(data.decode("utf-8"))
-    except (OSError, ValueError):
+        return loads_strict(data.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return None
 
 

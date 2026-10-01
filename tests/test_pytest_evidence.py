@@ -38,6 +38,34 @@ def sha(value):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+class TestReportReading(unittest.TestCase):
+    """The parent's reading of the child's report file. Needs no pytest."""
+
+    def read(self, text, limit=10**6):
+        import pytest_evidence as pe
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            return pe._read_report(path, limit)
+        finally:
+            os.unlink(path)
+
+    def test_a_line_with_a_repeated_key_is_malformed_and_its_last_value_is_not_kept(self):
+        good = '{"event": "session_finish", "exitstatus": 0}'
+        report = self.read('{"event": "session_finish", "exitstatus": 1, "exitstatus": 0}\n' + good + "\n")
+        self.assertEqual(report, {"present": True, "truncated": False, "malformed_lines": 1,
+                                  "events": [{"event": "session_finish", "exitstatus": 0}]})
+
+    def test_lines_that_cannot_be_decoded_are_counted(self):
+        report = self.read("{ not json\n" + "[" * 100000 + "]" * 100000 + '\n{"x": NaN}\n')
+        self.assertEqual((report["malformed_lines"], report["events"]), (3, []))
+
+    def test_a_missing_report_is_not_present(self):
+        import pytest_evidence as pe
+        self.assertEqual(pe._read_report("/nonexistent/report.jsonl", 10)["present"], False)
+
+
 @unittest.skipUnless(HAVE_PYTEST, "pytest is not installed in this interpreter; these tests run real pytest")
 class RunnerCase(unittest.TestCase):
     def setUp(self):

@@ -46,7 +46,8 @@ def phase(nodeid, when, outcome="passed", xfail=False):
 
 def passing_receipt(cwd="/work/project"):
     events = [{"event": "session_start", "run_id": RUN, "pytest_version": "9.1.1", "python_version": "3.12.12",
-               "rootdir": cwd, "inifile": None, "invocation_args": ["-q", "tests/test_a.py"]},
+               "rootdir": cwd, "inifile": None,
+               "invocation_args": ["-p", "pytest_capture", "-q", "tests/test_a.py"]},
               {"event": "selected", "nodeids": list(NODES)}]
     for node in NODES:
         events += [phase(node, "setup"), phase(node, "call"), phase(node, "teardown")]
@@ -105,7 +106,7 @@ class TestVerdicts(unittest.TestCase):
         self.assertTrue(any("not authenticated" in s for s in out["limits"]))
 
     def test_a_failed_phase_of_a_selected_item_is_contradicted(self):
-        for when in ("setup", "call", "teardown"):
+        for when in ("call", "teardown"):
             out = self.assess(failing_receipt(when))
             self.assertEqual((out["verdict"], out["reasons"]), ("contradicted", ["selected_item_failed"]), when)
 
@@ -238,6 +239,80 @@ class TestInsufficient(unittest.TestCase):
         self.check(lambda r: events_of(r).insert(2, {"event": "warning"}), "unknown_report_event", base=failing_receipt)
         self.check(lambda r: events_of(r).insert(4, phase(NODES[0], "call")), "repeated_phase", base=failing_receipt)
         self.check(lambda r: r["process"].update(exit_code=2), "exit_status_mismatch", base=failing_receipt)
+
+
+class TestStoredIdentityAndOrder(unittest.TestCase):
+    """A receipt whose stored identity or event order could not come from a run is not complete.
+
+    All for the recorded kind, which reads no current file: `unreachable` fails if it tries.
+    """
+
+    def reasons(self, change):
+        r = passing_receipt()
+        change(r)
+        c = claim(selection_digest=ce.digest_selection(NODES),
+                  declared_files_digest=sha(sorted([e["path"], e["sha256"], e["size"]] for e in r["declared_files"]["pre"])))
+        r["declared_files_digest"] = c["declared_files_digest"]
+        out = ce.assess(c, [r], check_current=unreachable)
+        self.assertEqual(out["verdict"], "insufficient")
+        return out["reasons"]
+
+    def test_declared_paths_that_name_no_file_under_cwd_are_malformed(self):
+        for path in ["../outside.py", "/absolute.py", "./src/a.py", "", "src\x00a.py", "src//a.py", "src/../a.py",
+                     "src\\a.py", "src/"]:
+            def change(r, path=path):
+                for side in ("pre", "post"):
+                    r["declared_files"][side][0]["path"] = path
+            self.assertEqual(self.reasons(change), ["malformed_receipt"], repr(path))
+
+    def test_cwd_that_is_not_an_absolute_normal_path_is_malformed(self):
+        for cwd in ["relative", "", "/recorded/../project", "/recorded/./project", "/recorded//project",
+                    "/recorded/project/", "/recorded\x00/project"]:
+            self.assertEqual(self.reasons(lambda r, cwd=cwd: r.update(cwd=cwd)), ["malformed_receipt"], repr(cwd))
+
+    def test_missing_or_mistyped_invocation_context_is_malformed(self):
+        for change in (lambda r: r.pop("argv"), lambda r: r.update(argv="python -m pytest"), lambda r: r.update(argv=[]),
+                       lambda r: r.update(argv=["", "-m", "pytest", "-p", "pytest_capture"]),
+                       lambda r: r.update(argv=["/usr/bin/python3", "-c", "pass"]),
+                       lambda r: r.pop("env_names_present"), lambda r: r.update(env_names_present=[1]),
+                       lambda r: r["process"].pop("started_at"), lambda r: r["process"].update(ended_at=True),
+                       lambda r: r["process"].update(timeout_seconds="600")):
+            self.assertEqual(self.reasons(change), ["malformed_receipt"])
+
+    def test_phases_before_the_selection_are_out_of_order(self):
+        def change(r):
+            ev = events_of(r)
+            r["report"]["events"] = [ev[0]] + ev[2:5] + [ev[1]] + ev[5:]
+        self.assertEqual(self.reasons(change), ["report_out_of_order"])
+
+    def test_phases_of_one_item_must_run_setup_call_teardown(self):
+        def reorder(order):
+            def change(r):
+                ev = events_of(r)
+                r["report"]["events"] = ev[:2] + [ev[i] for i in order] + ev[5:]
+            return change
+        for order in ([4, 3, 2], [3, 2, 4], [2, 4, 3]):
+            self.assertEqual(self.reasons(reorder(order)), ["phase_out_of_order"], order)
+        # A call after a setup that did not pass cannot happen either.
+        self.assertEqual(self.reasons(lambda r: events_of(r)[2].update(outcome="skipped")), ["phase_out_of_order"])
+
+    def test_phases_of_different_items_may_interleave(self):
+        r = passing_receipt()
+        ev = events_of(r)
+        r["report"]["events"] = ev[:2] + [ev[2], ev[5], ev[3], ev[6], ev[4], ev[7]] + ev[8:]
+        self.assertEqual(ce.assess(claim(), [r], check_current=unreachable)["verdict"], "supported")
+
+    def test_current_files_claim_with_a_nul_path_is_insufficient_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = passing_receipt(os.path.realpath(tmp))
+            for side in ("pre", "post"):
+                r["declared_files"][side][0]["path"] = "bad\x00.py"
+            d = sha([["bad\x00.py", FILE_HASH, 6]])
+            r["declared_files_digest"] = d
+            out = ce.assess(claim(kind="recorded_selection_passed_current_files", declared_files_digest=d), [r])
+            self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["malformed_receipt"]))
+            with self.assertRaises(ce.DeclaredFileError):
+                ce.snapshot_declared(os.path.realpath(tmp), ["bad\x00.py"])
 
 
 class TestReceiptSets(unittest.TestCase):
@@ -382,6 +457,27 @@ class TestCommandLine(unittest.TestCase):
             proc = self.run_cli(c, receipts)
             self.assertEqual(proc.returncode, code, proc.stderr)
             self.assertEqual(json.loads(proc.stdout)["verdict"], verdict)
+
+    def test_a_repeated_key_is_a_conflict_inside_one_file_and_is_not_resolved(self):
+        """json.loads keeps the last of two members. The first one said the run failed."""
+        for old, new in (('"exit_code": 0', '"exit_code": 1, "exit_code": 0'),
+                         ('"exitstatus": 0', '"exitstatus": 1, "exitstatus": 0'),
+                         ('"run_id": "run-0001", "schema"', '"run_id": "run-0002", "run_id": "run-0001", "schema"')):
+            raw = json.dumps(passing_receipt(), sort_keys=True)
+            self.assertEqual(raw.count(old), 1, old)
+            proc = self.run_cli(claim(), [raw.replace(old, new)])
+            self.assertEqual((proc.returncode, proc.stderr), (2, ""), old)
+            self.assertEqual(json.loads(proc.stdout)["reasons"], ["unreadable_receipt"])
+        proc = self.run_cli(None, [passing_receipt()], raw_claim=json.dumps(claim()).replace(
+            '"run_id": "run-0001"', '"run_id": "run-0009", "run_id": "run-0001"'))
+        self.assertEqual((proc.returncode, proc.stdout), (64, ""))
+
+    def test_input_that_cannot_be_decoded_is_unreadable_not_a_traceback(self):
+        deep = '{"run_id":"run-0001","nested":' + "[" * 100000 + "0" + "]" * 100000 + "}"
+        for raw in (deep, "\x00", '{"run_id": NaN}', '{"a": 1e999}', ""):
+            proc = self.run_cli(claim(), [raw])
+            self.assertEqual((proc.returncode, proc.stderr), (2, ""), raw[:30])
+            self.assertEqual(json.loads(proc.stdout)["reasons"], ["unreadable_receipt"])
 
     def test_unusable_invocations_exit_64_and_print_no_verdict(self):
         proc = self.run_cli(None, [passing_receipt()], raw_claim="{ not json")

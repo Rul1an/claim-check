@@ -119,8 +119,10 @@ def _read_report(path, max_bytes):
         if not line.strip():
             continue
         try:
-            events.append(json.loads(line))
-        except ValueError:
+            # Strict: a line that states one key twice is counted as malformed, so the
+            # conflict is still visible when the receipt is assessed.
+            events.append(ce.loads_strict(line))
+        except (ValueError, RecursionError):
             malformed += 1
     return {"present": True, "truncated": False, "malformed_lines": malformed, "events": events}
 
