@@ -102,6 +102,19 @@ class TestTranscriptCannotDecide(unittest.TestCase):
         ])
         self.assert_only(message, "insufficient")
 
+    def test_result_data_in_the_transcript_is_not_said_to_be_absent(self):
+        """The failed run's exit code and summary are in the transcript. The hook does not
+        evaluate them, and must say that, not that they are not there."""
+        _, message = run_hook([
+            tool_use("Bash", {"command": "pytest -q"}),
+            tool_result("Exit code: 1\n1 failed, 3 passed in 0.12s", is_error=True),
+            assistant("All tests pass."),
+        ])
+        self.assert_only(message, "insufficient")
+        self.assertIn("this hook does not evaluate tool results", message)
+        for false_statement in ("holds no", "no exit code", "does not hold"):
+            self.assertNotIn(false_statement, message)
+
     def test_a_later_successful_command_does_not_repair_a_failed_run(self):
         _, message = run_hook([
             tool_use("Bash", {"command": "pytest -q"}),

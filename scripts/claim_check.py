@@ -11,9 +11,10 @@ Two steps, kept apart:
   assess   — deterministic. Given a claim kind and what was observed, the verdict
              is fixed.
 
-A transcript holds tool requests. It does not hold results, exit codes or effects,
-and it does not hold what hooks, subagents, scripts or the user's own shell did. So
-this hook gives two verdicts and no others:
+This hook counts tool requests. It does not evaluate tool results, even where the
+transcript carries them: nothing here binds an exit code or a report to a claim. And a
+transcript does not show what hooks, subagents, scripts or the user's own shell did.
+So this hook gives two verdicts and no others:
   insufficient  — a test claim. A matching request may have been seen; a request is
                   not a result.
   unchecked     — a commit, push or file claim. Nothing here can check it.
@@ -368,7 +369,10 @@ def _requests(n: int, noun: str, qualifier: str = "") -> str:
     return f"1 {noun}{tail} was seen" if n == 1 else f"{n} {noun}s{tail} were seen"
 
 
-_NOT_A_RESULT = "A request is not a result: this transcript holds no exit code, report or effect."
+_NOT_A_RESULT = (
+    "A request is not a result, and this hook does not evaluate tool results: "
+    "nothing here binds an exit code or a report to the claim."
+)
 _NOT_ABSENCE = (
     "That does not show it did not happen: hooks, subagents, scripts and your own "
     "shell are not in view."
@@ -564,7 +568,7 @@ def transcript_with_settle(path: str) -> tuple[str, Observed]:
 # ---------------------------------------------------------------------------
 
 COVERAGE_NOTE = (
-    "claim-check reads tool requests in the transcript, not their results or effects. "
+    "claim-check counts tool requests in the transcript. It does not evaluate their results or effects. "
     "It cannot confirm or refute a claim. The labels above describe what was checkable "
     "here, not whether the claim is true."
 )
