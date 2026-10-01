@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""claim-check — compare what the agent said it did against what the session observed.
+"""claim-check — say what a transcript can and cannot show about the agent's claims.
 
-Runs as a Claude Code `Stop` hook. Reads the session transcript, extracts the final
-assistant message (the claims) and the tool calls (the observations), and reports only
-the mismatches.
+Runs as a Claude Code `Stop` hook. Reads the session transcript, extracts claim
+candidates from the final assistant message, and reports for each one what the
+transcript holds about it.
 
-Three outcomes, never two:
-  contradicted  — the claim is inconsistent with what was observed
-  unobservable  — hooks cannot see this; we say so instead of implying it is fine
-  confirmed     — matched; printed only in --verbose
+Two steps, kept apart:
+  extract  — heuristic. Regular expressions over prose. It misses claims and can
+             misread them. A match is a candidate, not an established statement.
+  assess   — deterministic. Given a claim kind and what was observed, the verdict
+             is fixed.
+
+A transcript holds tool requests. It does not hold results, exit codes or effects,
+and it does not hold what hooks, subagents, scripts or the user's own shell did. So
+this hook gives two verdicts and no others:
+  insufficient  — a test claim. A matching request may have been seen; a request is
+                  not a result.
+  unchecked     — a commit, push or file claim. Nothing here can check it.
+
+It never says `supported` or `contradicted`. Those need evidence that binds a result
+to a run; see claim_evidence.py and pytest_evidence.py, which this hook does not read.
 
 Design rules (deliberate, do not "fix" without reading README §Limits):
-  * Never blocks by default. Set CLAIM_CHECK_ENFORCE=1 to hand findings back to the agent.
+  * Never blocks. CLAIM_CHECK_ENFORCE is ignored: there is no verdict to block on.
   * Never crashes the session. Any internal error exits 0 silently.
-  * Silent when there is nothing to report.
-  * Conservative matching: a missed claim is much cheaper than a false accusation.
+  * Silent when no claim is recognised.
+  * Conservative matching: a missed claim is cheaper than an invented one.
+  * Command text and tool input never reach the report or the log.
 
 Stdlib only. Python 3.9+.
 """
@@ -59,11 +71,7 @@ def _version() -> str:
 
 VERSION = _version()
 
-# Exit codes per the Claude Code hook contract:
-#   0 = success (stdout surfaces in transcript mode)
-#   2 = blocking; stderr is fed back to the agent
 EXIT_OK = 0
-EXIT_BLOCK = 2
 
 # How long to wait for the transcript to flush the final assistant message.
 # The transcript is written asynchronously and can lag the in-memory conversation.
@@ -77,15 +85,15 @@ SETTLE_SLEEP_S = 0.4
 
 @dataclass
 class Observed:
-    """What the session actually did, as far as hooks can see."""
+    """Tool requests seen in the transcript. Counts and edit paths, no command text.
 
-    commands: list[str] = field(default_factory=list)
-    edited_paths: set[str] = field(default_factory=set)
-    # True when at least one tool call of a kind that can edit files was seen.
-    saw_edit_tool: bool = False
+    Every field counts requests. None of them says a command ran, finished or
+    succeeded, and a count of zero does not say nothing happened.
+    """
 
-    def ran_matching(self, pattern: re.Pattern[str]) -> list[str]:
-        return [c for c in self.commands if pattern.search(c)]
+    shell_requests: int = 0
+    test_requests: int = 0  # shell requests whose text names a test runner
+    edit_request_paths: list[str] = field(default_factory=list)
 
 
 TEST_CMD = re.compile(
@@ -105,10 +113,8 @@ TEST_CMD = re.compile(
 )
 
 # Running a test file directly — `python3 tests/test_foo.py`, `node x.test.js`.
-# Found by installing the hook live: this project runs its own tests that way and
-# the runner-name list above did not recognise it. The interpreter is required so
-# that `cat tests/test_foo.py` is not mistaken for running them, and the path token
-# may not contain whitespace so a heredoc body cannot be crossed.
+# The interpreter is required so that `cat tests/test_foo.py` is not counted, and the
+# path token may not contain whitespace so a heredoc body cannot be crossed.
 TEST_FILE_CMD = re.compile(
     r"""\b(python[0-9.]*|node|deno|bun|ruby|perl|php)\s+
         (?:-\w+\s+)*
@@ -116,14 +122,11 @@ TEST_FILE_CMD = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
-GIT_COMMIT_CMD = re.compile(r"\bgit\s+(-\S+\s+)*commit\b", re.IGNORECASE)
-GIT_PUSH_CMD = re.compile(r"\bgit\s+(-\S+\s+)*push\b", re.IGNORECASE)
-
 EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit", "str_replace_editor", "apply_patch"}
 SHELL_TOOLS = {"Bash", "BashOutput", "shell", "run_command"}
 
 # ---------------------------------------------------------------------------
-# Claim detection
+# Claim extraction (heuristic)
 #
 # Conservative by construction. Each pattern targets a confident, checkable
 # assertion; vague progress prose is deliberately not matched.
@@ -135,10 +138,9 @@ SHELL_TOOLS = {"Bash", "BashOutput", "shell", "run_command"}
 # (the bullet-summary idiom: "- Updated `src/foo.py`").
 # "and" or a comma continues a subject already established:
 #   "Committed and pushed."            -> and
-#   "…closed on head `abc`, pushed to" -> comma   (missed in a real session)
-# Trade-off, recorded deliberately: a comma also admits "Aegis reviewed it,
-# pushed a fix". Real transcripts showed the false NEGATIVE happening and the
-# false positive not, so the comma stays until data says otherwise.
+#   "…closed on head `abc`, pushed to" -> comma
+# The comma also admits "Aegis reviewed it, pushed a fix" and "nothing edited,
+# committed or pushed". The second is handled by NEGATIVE_BEFORE below.
 SUBJECT = r"(?:\bI\s+(?:have\s+|'ve\s+|just\s+)?|\band\s+|,\s+|(?:^|\n)\s*(?:[-*+]\s*)?)"
 
 CLAIM_TESTS_PASS = re.compile(
@@ -162,7 +164,7 @@ CLAIM_COMMITTED = re.compile(
 CLAIM_PUSHED = re.compile(SUBJECT + r"(pushed)\b", re.IGNORECASE | re.MULTILINE)
 
 # A sentence that negates the action is not a claim that it happened.
-# "I haven't committed" must never be reported as a missing commit.
+# "I haven't committed" must never be read as a commit claim.
 NEGATED = re.compile(
     r"""\b(
         have\s*n[o']?t | has\s*n[o']?t | had\s*n[o']?t
@@ -172,6 +174,15 @@ NEGATED = re.compile(
     )\b""",
     re.VERBOSE | re.IGNORECASE,
 )
+
+# "Nothing was edited, committed or pushed." is how a turn that only reports ends,
+# and SUBJECT's comma reads it as a commit claim. A word rule, not a parser: a
+# positive claim is dropped when one of these words comes before it in its sentence,
+# when the sentence opens with "not", or when one directly follows it ("pushed
+# nothing", "Committed: nothing"). The cost is known and tested: "There was no
+# reason to wait, so I committed" is dropped too.
+NEGATIVE_BEFORE = re.compile(r"\b(?:nothing|none|neither|nor|no)\b|^\W*not\b", re.IGNORECASE)
+NEGATIVE_AFTER = re.compile(r"(?::\s*|\s+)(?:nothing|none|no)\b", re.IGNORECASE)
 
 # A sentence reporting a failure is not a clean pass claim, even when it
 # contains the word "passes" ("the only failure was X, which passes in isolation").
@@ -207,7 +218,7 @@ def looks_like_file(path: str) -> bool:
         return True
     return bool(ext) and ext not in _TLD_LIKE
 
-# Phrases that make the whole message an explicit negative claim about files.
+# An explicit negative claim about a file.
 CLAIM_UNTOUCHED = re.compile(
     r"""\b(
         did\s*n[o']?t\s+(touch|modify|change|edit)
@@ -219,8 +230,7 @@ CLAIM_UNTOUCHED = re.compile(
 
 # A sentence that hedges, instructs, or looks forward is not a claim about
 # completed work. "This should make the tests pass once you run them" says
-# nothing about whether they ran. Dropping these is the main defence against
-# false accusations, which are far more expensive than missed claims.
+# nothing about whether they ran.
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 HEDGE = re.compile(
     r"""\b(
@@ -238,7 +248,7 @@ HEDGE = re.compile(
 
 
 # Markdown structure is not prose. Real sessions put URLs, tables and code
-# blocks in the final message, and every one of them produced a false positive
+# blocks in the final message, and every one of them was read as a claim
 # before this existed: "| E2E test … | Pass" read as a passing suite, and
 # "[updated](https://github.com/…)" read as a file edit.
 FENCED_CODE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
@@ -247,10 +257,11 @@ MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 BARE_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 
 # An inline-code span containing whitespace is a quoted phrase, not a path.
-# Found on real data: a message discussing this very plugin wrote
-# `"Committed and pushed."` as an example and tripped its own push check.
-# Single-token spans are kept, because that is where real paths live.
-INLINE_CODE_PROSE = re.compile(r"`[^`\n]*\s[^`\n]*`")
+# Single-token spans are kept, because that is where real paths live. Spans are
+# taken in order, pair by pair: a pattern that asks for "a span with a space in it"
+# pairs the closing backtick of one span with the opening backtick of the next and
+# deletes the prose between two paths.
+INLINE_CODE = re.compile(r"`[^`\n]*`")
 
 
 def strip_markup(text: str) -> str:
@@ -259,7 +270,7 @@ def strip_markup(text: str) -> str:
     text = TABLE_ROW.sub(" ", text)
     text = MD_LINK.sub(r"\1", text)  # keep the link text, drop the target
     text = BARE_URL.sub(" ", text)
-    text = INLINE_CODE_PROSE.sub(" ", text)
+    text = INLINE_CODE.sub(lambda m: " " if re.search(r"\s", m.group(0)) else m.group(0), text)
     return text
 
 
@@ -267,9 +278,8 @@ def assertive_sentences(text: str, drop_negated: bool = True) -> list[str]:
     """Sentences that assert completed work by the agent.
 
     Hedged, conditional and instructional sentences are always dropped. Negated
-    ones are dropped for POSITIVE claims ("I haven't committed" must never be
-    reported as a missing commit) but kept for the explicitly negative claim
-    ("I did not touch X"), which is itself the thing being checked.
+    ones are dropped for POSITIVE claims but kept for the explicitly negative
+    claim ("I did not touch X"), which is itself the thing being claimed.
     """
     out = []
     for s in SENTENCE_SPLIT.split(strip_markup(text)):
@@ -282,35 +292,119 @@ def assertive_sentences(text: str, drop_negated: bool = True) -> list[str]:
     return out
 
 
-def assertive_text(text: str) -> str:
-    """Back-compat view of :func:`assertive_sentences`."""
-    return "\n".join(assertive_sentences(text))
+@dataclass
+class Claim:
+    """A claim candidate found in prose. Not an established statement."""
+
+    kind: str  # tests_pass | tests_ran | committed | pushed | edited_file | left_untouched
+    quote: str
+    path: str = ""
+
+
+def _cancelled(sentence: str, m: "re.Match[str]") -> bool:
+    return bool(NEGATIVE_BEFORE.search(sentence[: m.start()]) or NEGATIVE_AFTER.match(sentence, m.end()))
+
+
+def extract(text: str) -> list[Claim]:
+    """Claim candidates in the final message, in a fixed order."""
+    claims: list[Claim] = []
+    sentences = assertive_sentences(text)
+
+    # One test claim per message, not one per phrasing. A sentence that also
+    # reports a failure is not a pass claim.
+    for s in sentences:
+        if FAILURE_CONTEXT.search(s):
+            continue
+        passed = CLAIM_TESTS_PASS.search(s)
+        m = passed or CLAIM_TESTS_RUN.search(s)
+        if m and not _cancelled(s, m):
+            claims.append(Claim("tests_pass" if passed else "tests_ran", m.group(0).strip()[:80]))
+            break
+
+    for kind, pattern, quote in (
+        ("committed", CLAIM_COMMITTED, "claimed a commit"),
+        ("pushed", CLAIM_PUSHED, "claimed a push"),
+    ):
+        if any(not _cancelled(s, m) for s in sentences for m in pattern.finditer(s)):
+            claims.append(Claim(kind, quote))
+
+    for s in sentences:
+        for m in CLAIM_EDITED_FILE.finditer(s):
+            if looks_like_file(m.group("path")) and not _cancelled(s, m):
+                claims.append(Claim("edited_file", m.group(0).strip()[:80], m.group("path")))
+
+    # Negation is the claim here, so this pass reads the sentences the others discard.
+    for s in assertive_sentences(text, drop_negated=False):
+        for m in CLAIM_UNTOUCHED.finditer(s):
+            claims.append(Claim("left_untouched", m.group(0).strip()[:80], m.group("path")))
+
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# Assessment (deterministic)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class Finding:
-    verdict: str  # "contradicted" | "unobservable" | "confirmed"
+class Assessment:
+    verdict: str  # "insufficient" | "unchecked"
+    kind: str
     claim: str
     detail: str
 
 
+def path_matches(requested: str, claimed: str) -> bool:
+    """True when a requested path ends with the claimed path on a component boundary."""
+    want = [p for p in claimed.replace("\\", "/").split("/") if p not in ("", ".")]
+    have = [p for p in requested.replace("\\", "/").split("/") if p not in ("", ".")]
+    return bool(want) and have[-len(want):] == want
+
+
+def _requests(n: int, noun: str, qualifier: str = "") -> str:
+    tail = f" {qualifier}" if qualifier else ""
+    if n == 0:
+        return f"no {noun}{tail} was seen"
+    return f"1 {noun}{tail} was seen" if n == 1 else f"{n} {noun}s{tail} were seen"
+
+
+_NOT_A_RESULT = "A request is not a result: this transcript holds no exit code, report or effect."
+_NOT_ABSENCE = (
+    "That does not show it did not happen: hooks, subagents, scripts and your own "
+    "shell are not in view."
+)
+
+
+def assess_passive(claim: Claim, observed: Observed) -> Assessment:
+    """What a transcript alone can say about one claim. Never supported or contradicted."""
+    if claim.kind in ("tests_pass", "tests_ran"):
+        verdict, n, what = "insufficient", observed.test_requests, ("tool request", "naming a test runner")
+    elif claim.kind in ("committed", "pushed"):
+        # Command text is not read for these: which request, if any, was a commit or
+        # a push is not something a string match can settle.
+        verdict, n, what = "unchecked", observed.shell_requests, ("shell-tool request",)
+    elif claim.kind in ("edited_file", "left_untouched"):
+        verdict = "unchecked"
+        n = sum(1 for p in observed.edit_request_paths if path_matches(p, claim.path))
+        what = ("editing-tool request", f"for a path ending in `{claim.path}`")
+    else:
+        return Assessment("unchecked", claim.kind, claim.quote, "this kind of claim is not assessed")
+    detail = f"{_requests(n, *what)}. {_NOT_A_RESULT if n else _NOT_ABSENCE}"
+    return Assessment(verdict, claim.kind, claim.quote, detail)
+
+
 @dataclass
 class Result:
-    """Findings plus the denominator they were drawn from.
+    """Assessments plus the denominator they were drawn from.
 
-    Without the counts, "no findings" is indistinguishable from "nothing was
-    checkable" — which is the exact confusion this tool exists to expose, and
-    which it committed itself for nine live runs before this existed.
+    Without the count, "nothing reported" is indistinguishable from "nothing was
+    recognised".
     """
 
-    findings: list[Finding] = field(default_factory=list)
+    assessments: list[Assessment] = field(default_factory=list)
     claims_found: int = 0
     unverifiable: list[str] = field(default_factory=list)
     language: str = "en"
-
-    @property
-    def checkable(self) -> bool:
-        return self.claims_found > 0
 
 
 # Claim patterns are English-only. A non-English message is not "clean", it is
@@ -330,6 +424,21 @@ def looks_english(text: str) -> bool:
         return True  # too short to judge; do not cry wolf
     hits = sum(1 for w in words if w in EN_STOPWORDS)
     return (hits / len(words)) >= 0.12
+
+
+def review(text: str, observed: Observed) -> Result:
+    res = Result(language="en" if looks_english(text) else "other")
+    if not text.strip():
+        return res
+    if res.language != "en":
+        res.unverifiable.append(
+            "the final message is not English; claim patterns are English-only"
+        )
+        return res
+    claims = extract(text)
+    res.claims_found = len(claims)
+    res.assessments = [assess_passive(c, observed) for c in claims]
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -382,43 +491,59 @@ def read_transcript(path: str) -> list[dict]:
     return entries
 
 
+def _observe(observed: Observed, block: dict) -> None:
+    name = block.get("name")
+    inp = block.get("input")
+    if not isinstance(name, str):
+        return
+    if name in SHELL_TOOLS:
+        observed.shell_requests += 1
+        cmd = (inp.get("command") or inp.get("cmd")) if isinstance(inp, dict) else None
+        if isinstance(cmd, str) and (TEST_CMD.search(cmd) or TEST_FILE_CMD.search(cmd)):
+            observed.test_requests += 1
+    elif name in EDIT_TOOLS and isinstance(inp, dict):
+        p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
+        if isinstance(p, str) and p.strip():
+            observed.edit_request_paths.append(p.strip())
+
+
 def collect(entries: list[dict]) -> tuple[str, Observed]:
-    """Return (final assistant text, observations)."""
+    """Return (current final assistant prose or "", observations).
+
+    Prose is current only while nothing follows it on the main chain: a later user
+    entry or a later tool request means the turn it closed is over or was never
+    closed, and assessing it would judge a stale message.
+    """
     observed = Observed()
-    final_text_parts: list[str] = []
+    current: list[str] = []
 
     for entry in entries:
         # A subagent's message is not the main agent's claim.
         if isinstance(entry, dict) and entry.get("isSidechain"):
             continue
         role = _entry_role(entry)
-        is_assistant = role == "assistant"
-        text_parts: list[str] = []
+        texts: list[str] = []
+        requested = False
 
         for block in _iter_content_blocks(entry):
             btype = block.get("type")
             if btype == "tool_use":
-                name = str(block.get("name") or "")
-                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-                if name in SHELL_TOOLS:
-                    cmd = inp.get("command") or inp.get("cmd") or ""
-                    if isinstance(cmd, str) and cmd.strip():
-                        observed.commands.append(cmd)
-                elif name in EDIT_TOOLS:
-                    observed.saw_edit_tool = True
-                    p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
-                    if isinstance(p, str) and p.strip():
-                        observed.edited_paths.add(p.strip())
-            elif btype == "text" and is_assistant:
+                requested = True
+                _observe(observed, block)
+            elif btype == "text" and role == "assistant":
                 t = block.get("text")
                 if isinstance(t, str):
-                    text_parts.append(t)
+                    texts.append(t)
 
-        if is_assistant and text_parts:
-            # Keep only the latest assistant prose; earlier turns are not the claim.
-            final_text_parts = text_parts
+        if role == "assistant":
+            if requested:
+                current = []
+            elif any(t.strip() for t in texts):
+                current = texts
+        elif role == "user":
+            current = []
 
-    return "\n".join(final_text_parts).strip(), observed
+    return "\n".join(current).strip(), observed
 
 
 def transcript_with_settle(path: str) -> tuple[str, Observed]:
@@ -435,151 +560,27 @@ def transcript_with_settle(path: str) -> tuple[str, Observed]:
 
 
 # ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
-
-
-def _basename(p: str) -> str:
-    return p.rstrip("/").split("/")[-1]
-
-
-def review(text: str, observed: Observed) -> Result:
-    """Full result: findings plus the denominator."""
-    res = Result(language="en" if looks_english(text) else "other")
-    if not text.strip():
-        return res
-    if res.language != "en":
-        res.unverifiable.append(
-            "the final message is not English; claim patterns are English-only"
-        )
-        return res
-    res.findings = check(text, observed)
-    res.claims_found = count_claims(text)
-    return res
-
-
-def count_claims(text: str) -> int:
-    """How many claim-shaped statements were recognised at all."""
-    n = 0
-    sentences = assertive_sentences(text)
-    for s in sentences:
-        if not FAILURE_CONTEXT.search(s) and (
-            CLAIM_TESTS_PASS.search(s) or CLAIM_TESTS_RUN.search(s)
-        ):
-            n += 1
-        if CLAIM_COMMITTED.search(s) or CLAIM_PUSHED.search(s):
-            n += 1
-        n += sum(
-            1 for m in CLAIM_EDITED_FILE.finditer(s) if looks_like_file(m.group("path"))
-        )
-    n += len(list(CLAIM_UNTOUCHED.finditer("\n".join(assertive_sentences(text, False)))))
-    return n
-
-
-def check(text: str, observed: Observed) -> list[Finding]:
-    findings: list[Finding] = []
-    raw_text = text
-    sentences = assertive_sentences(text)
-    if not sentences and not text.strip():
-        return findings
-
-    # 1 & 2 — tests. A sentence that also reports a failure is not a pass claim.
-    for s in sentences:
-        if FAILURE_CONTEXT.search(s):
-            continue
-        m = CLAIM_TESTS_PASS.search(s) or CLAIM_TESTS_RUN.search(s)
-        if m:
-            if not (observed.ran_matching(TEST_CMD) or observed.ran_matching(TEST_FILE_CMD)):
-                findings.append(
-                    Finding(
-                        "contradicted",
-                        m.group(0).strip(),
-                        "no test command was observed in this session",
-                    )
-                )
-            break  # one verdict per session, not one per phrasing
-
-    # 3 — commit
-    if any(CLAIM_COMMITTED.search(s) for s in sentences) and not observed.ran_matching(
-        GIT_COMMIT_CMD
-    ):
-        findings.append(
-            Finding("contradicted", "claimed a commit", "no `git commit` was observed")
-        )
-
-    # 4 — push
-    if any(CLAIM_PUSHED.search(s) for s in sentences) and not observed.ran_matching(GIT_PUSH_CMD):
-        findings.append(Finding("contradicted", "claimed a push", "no `git push` was observed"))
-
-    # 5 — named file edits
-    text = "\n".join(sentences)
-    edited_basenames = {_basename(p) for p in observed.edited_paths}
-    for m in CLAIM_EDITED_FILE.finditer(text):
-        path = m.group("path")
-        if not looks_like_file(path):
-            continue
-        if _basename(path) in edited_basenames:
-            continue
-        # A file can be written by a shell redirect or a subprocess; hooks see the
-        # command string, not its effects. Only speak where we can be sure.
-        if any(path in c or _basename(path) in c for c in observed.commands):
-            continue
-        verdict = "contradicted" if observed.saw_edit_tool else "unobservable"
-        detail = (
-            f"no edit to `{path}` was observed"
-            if verdict == "contradicted"
-            else f"no file-editing tool ran; an edit to `{path}` cannot be confirmed here"
-        )
-        findings.append(Finding(verdict, m.group(0).strip()[:80], detail))
-
-    # 6 — explicit "did not touch X". Negation is the claim here, so this pass
-    # reads the sentences that step 1-5 deliberately discarded.
-    negative_text = "\n".join(assertive_sentences(raw_text, drop_negated=False))
-    for m in CLAIM_UNTOUCHED.finditer(negative_text):
-        path = m.group("path")
-        if _basename(path) in edited_basenames:
-            findings.append(
-                Finding(
-                    "contradicted",
-                    m.group(0).strip()[:80],
-                    f"`{path}` was edited in this session",
-                )
-            )
-
-    return findings
-
-
-# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
 COVERAGE_NOTE = (
-    "claim-check sees tool calls, not their effects: a shell redirect or a subprocess "
-    "can change files with no trace here. Absence of an observation is not proof of absence."
+    "claim-check reads tool requests in the transcript, not their results or effects. "
+    "It cannot confirm or refute a claim. The labels above describe what was checkable "
+    "here, not whether the claim is true."
 )
 
 
-def render(result: Result, enforce: bool) -> str:
-    findings = result.findings
-    contradicted = [f for f in findings if f.verdict == "contradicted"]
-    unobservable = [f for f in findings if f.verdict == "unobservable"]
-
-    lines = ["", "claim-check — what was said vs what this session observed", ""]
+def render(result: Result) -> str:
+    lines = ["", "claim-check — what the final message claims, and what this transcript can show", ""]
     for reason in result.unverifiable:
         lines.append(f"  unchecked     {reason}")
     if result.unverifiable:
         lines.append("")
-    for f in contradicted:
-        lines.append(f"  contradicted  {f.claim}")
-        lines.append(f"                {f.detail}")
-    for f in unobservable:
-        lines.append(f"  unobservable  {f.claim}")
-        lines.append(f"                {f.detail}")
+    for a in result.assessments:
+        lines.append(f"  {a.verdict:<13} {a.claim}")
+        lines.append(f"                {a.detail}")
     lines.append("")
     lines.append(f"  note: {COVERAGE_NOTE}")
-    if enforce:
-        lines.append("")
-        lines.append("  Verify the claim or correct the statement before finishing.")
     lines.append("")
     return "\n".join(lines)
 
@@ -631,7 +632,6 @@ def main() -> int:
     if not isinstance(payload, dict):
         return EXIT_OK
 
-    # Do not re-fire on a stop that we ourselves caused.
     if payload.get("stop_hook_active"):
         return EXIT_OK
 
@@ -653,36 +653,32 @@ def main() -> int:
     if result.unverifiable and _already_reported_limit(session_id):
         result.unverifiable = []
 
-    findings = result.findings
     _log(
         {
             "event": "ran",
+            "current_message": bool(text),
             "final_text_chars": len(text),
-            "commands": len(observed.commands),
-            "edited_paths": len(observed.edited_paths),
+            "shell_requests": observed.shell_requests,
+            "test_requests": observed.test_requests,
+            "edit_requests": len(observed.edit_request_paths),
             "language": result.language,
             "claims_found": result.claims_found,
             "unverifiable": result.unverifiable,
-            "findings": [{"verdict": f.verdict, "detail": f.detail} for f in findings],
+            "assessments": [{"verdict": a.verdict, "kind": a.kind} for a in result.assessments],
         }
     )
 
-    if not findings and not result.unverifiable:
+    if not result.assessments and not result.unverifiable:
         return EXIT_OK
 
-    enforce = os.environ.get("CLAIM_CHECK_ENFORCE", "").strip() in {"1", "true", "yes"}
-    report = render(result, enforce)
-
-    if enforce and any(f.verdict == "contradicted" for f in findings):
-        sys.stderr.write(report)
-        return EXIT_BLOCK
-
-    # Report mode: bare stdout on exit 0 only surfaces in transcript view, so a
-    # finding could be produced 500 times and never seen. The documented hook
-    # envelope puts it where the user actually is.
-    sys.stdout.write(
-        json.dumps({"continue": True, "suppressOutput": False, "systemMessage": report})
-    )
+    # Bare stdout on exit 0 only surfaces in transcript view. The documented hook
+    # envelope puts the report where the user actually is.
+    try:
+        sys.stdout.write(
+            json.dumps({"continue": True, "suppressOutput": False, "systemMessage": render(result)})
+        )
+    except Exception:
+        pass
     return EXIT_OK
 
 
