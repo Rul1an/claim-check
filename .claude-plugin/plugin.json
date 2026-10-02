@@ -1,6 +1,6 @@
 {
   "name": "claim-check",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Says what the session transcript can and cannot show about the claims in the agent's final message, and checks a scoped test claim against an opt-in pytest receipt.",
   "author": {
     "name": "Assay"

@@ -161,7 +161,11 @@ recorded once each, in that order, as passed; no skip and no xfail-marked item; 
 launch argv, working directory and declared paths present and well-formed.
 
 `contradicted` needs the same binding, exit code 1, a selected item with a failed phase, and no
-xfail-marked item anywhere in the selection.
+xfail-marked item anywhere in the selection. One recorded failure is enough: the claim is that
+every selected item passed, and a failed phase of a selected item refutes that whatever else the
+run did. So the rest of the selection does not have to be accounted for. An item with no recorded
+phases (never reached after `-x`) or a failed item with a phase missing still gives
+`contradicted`. A missing phase stands in the way of `supported` only.
 
 An xfail-marked item, whether it failed as expected, passed unexpectedly, or passed under
 `strict=True` (which pytest itself reports as a failure with exit code 1), makes the receipt
@@ -170,7 +174,7 @@ pytest puts in its report, `[XPASS(strict)]`; there is no other mark for it.
 
 Everything else is `insufficient`, with reason codes: no tests collected, a skip, an xfail, a
 collection error, a timeout, a missing or cut report, an unknown, repeated or mistyped report
-line, a repeated, missing or out-of-order phase, a key stated twice in a receipt or a report line,
+line, a repeated or out-of-order phase, a missing phase where no selected item failed, a key stated twice in a receipt or a report line,
 input that is not valid UTF-8 JSON or nests more than 16 levels, an exit status that differs from the process exit code, a
 different run, selection or declared-file identity, a declared file that changed, went missing or
 became a symlink. Two different receipts for the same run are both listed and neither is used.
@@ -205,12 +209,59 @@ as compact JSON.
   expect `insufficient`. Reruns repeat a phase and are `insufficient` too.
 - The timeout kills the child's process group. A process that leaves that group outlives it.
 
+## Part 3: bind a claim to a receipt, and print the assessment
+
+Two conveniences on top of the checker. Neither changes a verdict.
+
+```bash
+python3 scripts/claim_report.py bind --kind recorded_selection_passed \
+  --receipt .claim-check/receipts/<run_id>.json > claim.json
+python3 scripts/claim_report.py report --claim claim.json --receipt .claim-check/receipts/<run_id>.json
+```
+
+`bind` writes the claim for you: the kind you name, and the run id, selection digest and
+declared-file digest of the one receipt you name, recomputed from the receipt's content. It adds
+`"scope_source": "receipt"` to say where the scope came from; the checker does not read that
+member and it proves nothing. `bind` takes no sentence, no transcript and no directory.
+
+**Binding is not evidence.** A claim bound to a receipt always matches that receipt's identity,
+so binding cannot make a claim more true. It works the same for a run that failed, timed out or
+changed its declared files; what the run showed is decided by `report`. `bind` refuses (exit 64)
+only a receipt with no usable identity: not a JSON object, another schema, no run id, not exactly
+one well-formed selection, malformed declared files, or stored digests that contradict the
+content.
+
+`report` runs the assessment once and prints it:
+
+```
+Verdict: contradicted
+Claim kind: "recorded_selection_passed"
+Scope: {"cwd": "/work/project", "declared_file_count": 1, "declared_files_digest": "sha256:…", "run_id": "…", "selected_count": 2, "selection_digest": "sha256:…"}
+Reasons: ["selected_item_failed"]
+Evidence: ["sha256:…"]
+Limits:
+- A receipt is not authenticated: whoever can write it can write a consistent false one.
+- Declared files are a comparison of snapshots taken before and after the run. They are not the bytes pytest loaded, not its dependencies, and not an atomic snapshot.
+- The verdict holds for this run and this selection only.
+Binding does not add evidence or authenticate the receipt.
+```
+
+The exit code is the verdict, as for `claim_evidence.py assess`. The layout is fixed and the same
+input gives the same bytes; receipt digests are sorted, reason codes are printed as the checker
+gave them, in its order, with no explanation added. Strings that come from a receipt or a claim
+are escaped to ASCII and cut at 120 characters, lists at 16 reasons and 8 digests, and a field
+that was cut is labelled `(truncated)` and carries `[truncated]`. If the text does not fit
+`--max-bytes` (default 4000) a compact form is printed in which every variable field is replaced
+by `[truncated]`. The verdict, the three limits and the last line are never cut: a budget below
+549 bytes is refused. The report names no test.
+
 ## Tests
 
 ```bash
 python3 tests/test_claim_check.py        # the hook; stdlib only
 python3 tests/test_claim_evidence.py     # the checker; stdlib only
 python3 tests/test_pytest_evidence.py    # the runner; needs pytest, runs real pytest subprocesses
+python3 tests/test_claim_report.py       # bind and report; one test needs pytest
 ```
 
 The runner tests cover a pass, an assertion failure, a teardown failure, a collection error, zero
