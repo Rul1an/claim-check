@@ -304,8 +304,34 @@ class TestBind(unittest.TestCase):
         for name, change in refused.items():
             receipt = fx.passing_receipt()
             change(receipt)
-            with self.assertRaises(cr.BindError, msg=name):
-                cr.bind_claim("recorded_selection_passed", None if name == "not a dict" else receipt)
+            self.assert_refused(None if name == "not a dict" else receipt, name)
+
+    def assert_refused(self, receipt, name):
+        try:
+            cr.bind_claim("recorded_selection_passed", receipt)
+        except cr.BindError:
+            return
+        except Exception as exc:  # a crash is not a refusal
+            self.fail("%s: bind raised %s, not BindError" % (name, type(exc).__name__))
+        self.fail("%s: bind accepted the receipt" % name)
+
+    def test_malformed_identity_is_refused_even_when_the_stored_digests_agree_with_it(self):
+        """Without this, the digest comparison alone would refuse these, and the structural
+        checks would be untested."""
+        twice = fx.passing_receipt()
+        twice["report"]["events"][1]["nodeids"] = [fx.NODES[0], fx.NODES[0]]
+        twice["selection_digest"] = fx.sha([fx.NODES[0], fx.NODES[0]])
+        self.assert_refused(twice, "a node id twice, digest consistent")
+
+        outside = fx.passing_receipt()
+        outside["declared_files"]["pre"][0]["path"] = "../x.py"
+        outside["declared_files_digest"] = fx.sha([["../x.py", fx.FILE_HASH, 6]])
+        self.assert_refused(outside, "declared path outside cwd, digest consistent")
+
+        negative = fx.passing_receipt()
+        negative["declared_files"]["pre"][0]["size"] = -1
+        negative["declared_files_digest"] = fx.sha([["src/a.py", fx.FILE_HASH, -1]])
+        self.assert_refused(negative, "negative size, digest consistent")
 
     def test_only_a_known_kind_can_be_bound(self):
         for kind in ("all_tests_pass", "", None, 7, ["recorded_selection_passed"]):
@@ -368,6 +394,13 @@ class TestBindCommand(CommandLine):
         for args in cases:
             proc = self.run_cli(*args)
             self.assertEqual((proc.returncode, proc.stdout), (64, ""), args[1:4])
+
+    def test_options_are_matched_whole_not_by_prefix(self):
+        good = self.path("good.json", fx.passing_receipt())
+        for args in (["bind", "--kin", "recorded_selection_passed", "--receipt", good],
+                     ["bind", "--kind", "recorded_selection_passed", "--rec", good]):
+            proc = self.run_cli(*args)
+            self.assertEqual((proc.returncode, proc.stdout), (64, ""), args)
 
     def test_bind_has_no_way_to_take_a_sentence(self):
         good = self.path("good.json", fx.passing_receipt())
