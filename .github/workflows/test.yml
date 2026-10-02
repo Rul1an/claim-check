@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 -m pip install pytest
           python3 tests/test_pytest_evidence.py
+          python3 tests/test_claim_report.py
 
   validate:
     name: validate plugin manifests
