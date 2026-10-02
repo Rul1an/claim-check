@@ -176,7 +176,21 @@ def _kill(proc):
         pass
 
 
+def _limits_ok(timeout, max_output_bytes, max_report_bytes):
+    """A timeout that is not finite never ends the run and cannot be written as JSON."""
+    return (
+        type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0
+        and type(max_output_bytes) is int and max_output_bytes >= 0
+        and type(max_report_bytes) is int and max_report_bytes >= 0
+    )
+
+
 def run(receipt_dir, declare, pytest_args, timeout, max_output_bytes, max_report_bytes):
+    # Checked here and not only in main(): this function is also called from Python.
+    if not _limits_ok(timeout, max_output_bytes, max_report_bytes):
+        sys.stderr.write("refused: the timeout must be a positive, finite number of seconds and the byte limits "
+                         "must not be negative\n")
+        return EXIT_USAGE
     cwd = os.path.realpath(os.getcwd())
     if not declare:
         sys.stderr.write("refused: declare at least one file with --declare; a receipt with no declared scope is not written\n")
@@ -313,10 +327,6 @@ def main(argv=None):
         return EXIT_USAGE
     if args.command != "run":
         parser.print_usage(sys.stderr)
-        return EXIT_USAGE
-    if not (math.isfinite(args.timeout) and args.timeout > 0) or args.max_output_bytes < 0 or args.max_report_bytes < 0:
-        sys.stderr.write("refused: --timeout must be a positive, finite number of seconds and the byte limits "
-                         "must not be negative\n")
         return EXIT_USAGE
     pytest_args = args.pytest_args[1:] if args.pytest_args[:1] == ["--"] else args.pytest_args
     return run(args.receipt_dir, args.declare, pytest_args, args.timeout, args.max_output_bytes, args.max_report_bytes)

@@ -84,6 +84,23 @@ class TestReportReading(unittest.TestCase):
         self.assertEqual(pe._read_report("/nonexistent/report.jsonl", 10)["present"], False)
 
 
+class TestRunEntry(unittest.TestCase):
+    """`run()` called from Python, past the argument parser. Needs no pytest: nothing may launch."""
+
+    def test_unusable_limits_are_refused_at_entry_and_nothing_is_launched(self):
+        from unittest import mock
+        import pytest_evidence as pe
+        with tempfile.TemporaryDirectory() as tmp:
+            receipts = os.path.join(tmp, "receipts")
+            for timeout, out_limit, report_limit in ((float("inf"), 0, 10), (float("-inf"), 0, 10), (float("nan"), 0, 10),
+                                                     (0.0, 0, 10), (-1.0, 0, 10), (60.0, -1, 10), (60.0, 0, -1)):
+                with mock.patch.object(pe.subprocess, "Popen", side_effect=AssertionError("launched")) as launch, \
+                        mock.patch.object(pe.ce, "snapshot_declared", side_effect=AssertionError("read a file")):
+                    code = pe.run(receipts, ["src/calc.py"], ["-q"], timeout, out_limit, report_limit)
+                self.assertEqual((code, launch.call_count), (64, 0), timeout)
+                self.assertFalse(os.path.exists(receipts), timeout)
+
+
 @unittest.skipUnless(HAVE_PYTEST, "pytest is not installed in this interpreter; these tests run real pytest")
 class RunnerCase(unittest.TestCase):
     def setUp(self):
@@ -395,6 +412,12 @@ class TestReceiptPublication(RunnerCase):
         with open(existing, "rb") as fh:
             self.assertEqual(fh.read(), b"older receipt bytes")
 
+    def test_a_receipt_that_would_hold_a_non_finite_number_is_not_written(self):
+        """Second line of defence behind the entry check: if a non-finite number reaches the
+        receipt by any route, it is not serialised as `Infinity` and no file appears."""
+        code, out = self.run_in_process(("time", "time", {"return_value": float("inf")}))
+        self.assertEqual((code, out, self.entries()), (70, "", []))
+
     def test_without_a_fault_the_same_path_publishes_one_complete_private_receipt(self):
         code, out = self.run_in_process()
         summary = json.loads(out)
@@ -457,17 +480,6 @@ class TestReceiptFile(RunnerCase):
             self.assertEqual((proc.returncode, summary), (64, None), value)
             self.assertFalse(os.path.exists(os.path.join(self.cwd, "ran.marker")), value)
             self.assertFalse(os.path.exists(self.receipts), value)
-
-    def test_a_receipt_that_would_hold_a_non_finite_number_is_not_written(self):
-        """Second line of defence: called past the argument check, the runner refuses to
-        serialise `Infinity` and leaves no receipt."""
-        self.write("test_ok.py", PASSING)
-        code = ("import sys; sys.path.insert(0, %r); import pytest_evidence as pe; "
-                "sys.exit(pe.run(%r, ['src/calc.py'], ['-q', '-p', 'no:cacheprovider', 'test_ok.py'], "
-                "float('inf'), 1000, 10**6))" % (os.path.join(ROOT, "scripts"), self.receipts))
-        proc = subprocess.run([sys.executable, "-B", "-c", code], cwd=self.cwd, capture_output=True, text=True, timeout=120)
-        self.assertEqual((proc.returncode, proc.stdout), (70, ""), proc.stderr[-300:])
-        self.assertEqual([f for f in os.listdir(self.receipts) if not f.startswith(".")], [])
 
     def test_usage_errors_exit_64_without_a_receipt(self):
         self.write("test_ok.py", PASSING)
