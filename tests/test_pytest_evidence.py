@@ -511,6 +511,24 @@ class TestReceiptFile(RunnerCase):
             self.assertFalse(os.path.exists(os.path.join(self.cwd, "ran.marker")), value)
             self.assertFalse(os.path.exists(self.receipts), value)
 
+    def test_an_unusable_receipt_directory_exits_70_before_pytest_starts(self):
+        """Characterisation of an exit code the README now documents; it held before this change."""
+        self.write("test_marker.py", "def test_leaves_a_marker():\n    open('ran.marker', 'w').close()\n")
+        self.write("receipts", "a regular file where the directory should be\n")
+        proc, summary, _ = self.run_runner(["-q", "test_marker.py"])
+        self.assertEqual((proc.returncode, summary), (70, None))
+        self.assertFalse(os.path.exists(os.path.join(self.cwd, "ran.marker")))
+
+    def test_an_existing_receipt_directory_keeps_its_permissions(self):
+        """The runner does not chmod a directory it did not create."""
+        self.write("test_ok.py", PASSING)
+        os.mkdir(self.receipts)
+        os.chmod(self.receipts, 0o755)
+        proc, summary, _ = self.run_runner(["-q", "test_ok.py"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(self.receipts).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(summary["receipt"]).st_mode), 0o600)
+
     def test_usage_errors_exit_64_without_a_receipt(self):
         self.write("test_ok.py", PASSING)
         for extra in (["--timeout", "0"], ["--timeout", "abc"], ["--max-output-bytes", "-1"]):

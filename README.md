@@ -35,7 +35,8 @@ claim-check — what the final message claims, and what this transcript can show
 
 Works in the Claude Code CLI and the desktop app. The hook needs Python 3.9+ and nothing else: no
 network calls, no configuration, no telemetry. The runner needs pytest in the interpreter you start
-it with.
+it with. The runner and the checker are POSIX-only: the working directory and declared files are
+handled as POSIX paths, and on Windows every run is refused.
 
 ## Why
 
@@ -103,8 +104,20 @@ python3 scripts/pytest_evidence.py run \
 The runner starts `python -m pytest` as an argument vector, with no shell, waits for it, and writes
 `<receipt-dir>/<run_id>.json`. It prints one line with the receipt path, the run id, the selection
 digest and the declared-file digest. Pytest's own output goes to stderr, capped at
-`--max-output-bytes`; the child is still read to the end. `--timeout` (default 600 s) kills the
-run. The exit code is pytest's; 124 on timeout; 64 when the run was refused.
+`--max-output-bytes`; the child is still read to the end. `--timeout` (default 600 s, a positive
+finite number) kills the run.
+
+Runner exit codes: pytest's own when pytest ran to its end; 124 when the run was killed on timeout;
+128+N when the child died on signal N; 64 when the run was refused or the arguments are unusable,
+before pytest starts; 70 when the receipt directory cannot be used, pytest cannot be started, or
+the receipt cannot be serialised or written. After 64 or 70 there is no receipt and no summary
+line. 70 can also follow a pytest run that finished.
+
+The receipt appears under `<run_id>.json` only once it is complete: it is written to a temporary
+file in the same directory, flushed, synced and closed, and then linked to its final name, which
+fails if that name exists. A write that fails leaves nothing under the final name. Removing the
+temporary file is best effort; a run killed outright can leave a `.receipt-*.tmp` behind. This is
+about what a reader can see, not about power loss: the directory is not synced.
 
 A receipt records:
 
@@ -144,10 +157,16 @@ Two claim kinds:
 digest equal to the claim's; the process completed with exit code 0 and pytest's own exit status
 agrees; exactly one session start, one selection and one session finish, with the selection before
 any test phase; at least one selected item; every selected item with setup, call and teardown
-recorded once each, in that order, as passed; no skip, xfail or xpass; no collection error; the
+recorded once each, in that order, as passed; no skip and no xfail-marked item; no collection error; the
 launch argv, working directory and declared paths present and well-formed.
 
-`contradicted` needs the same binding, exit code 1, and a selected item with a failed phase.
+`contradicted` needs the same binding, exit code 1, a selected item with a failed phase, and no
+xfail-marked item anywhere in the selection.
+
+An xfail-marked item, whether it failed as expected, passed unexpectedly, or passed under
+`strict=True` (which pytest itself reports as a failure with exit code 1), makes the receipt
+`insufficient`, also when another item really failed. The strict case is recognised by the text
+pytest puts in its report, `[XPASS(strict)]`; there is no other mark for it.
 
 Everything else is `insufficient`, with reason codes: no tests collected, a skip, an xfail, a
 collection error, a timeout, a missing or cut report, an unknown, repeated or mistyped report
@@ -169,16 +188,22 @@ as compact JSON.
 - **A passing selection is not "all tests pass".** The checker assesses a selection named by its
   node ids. It is never attached to a sentence in a message, and the hook does not read receipts.
   A run of one test supports a claim about that one test.
+- **The snapshot's path checks are not a sandbox.** Refusing symlinks and `..` is a check on the
+  path as it was when each file was read. Another process that swaps a directory or a file between
+  the check and the read, or between the two reads, is not detected.
 - **Declared files are a comparison of snapshots of the files you named.** They are not the bytes
   pytest loaded: imports from outside the list, bytecode caches, installed packages and a file
   edited and restored between the two reads are all outside it. The two reads are not atomic.
 - **A result depends on things no receipt binds**: environment variables (only the names of a
   few pytest-related ones are recorded, never values), the network, the clock, test order.
-- **A receipt is private.** It holds the pytest arguments and paths, which can carry secrets. It
-  is written with mode 0600 in a directory created 0700, and nothing sends it anywhere.
+- **A receipt is private, if its directory is.** It holds the pytest arguments and paths, which
+  can carry secrets. The file is written with mode 0600 and nothing sends it anywhere. A receipt
+  directory the runner creates gets mode 0700; one that already exists keeps the permissions it
+  has, and the runner does not change them. Give it a directory only you can write: mode 0600 on
+  the file does not stop someone who can write the directory from replacing the file.
 - Plugins that move reporting out of the pytest process, such as pytest-xdist, are not handled;
   expect `insufficient`. Reruns repeat a phase and are `insufficient` too.
-- The timeout kills the process group on POSIX. Elsewhere only the direct child is killed.
+- The timeout kills the child's process group. A process that leaves that group outlives it.
 
 ## Tests
 

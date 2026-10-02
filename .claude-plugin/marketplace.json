@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "claim-check",
-  "description": "Verification hooks for agentic coding: check what the agent said it did against what the session observed.",
+  "description": "Verification hooks for agentic coding: report what a session transcript can and cannot show about what the agent said it did, and check a scoped test claim against a pytest receipt.",
   "owner": {
     "name": "Rul1an",
     "url": "https://github.com/Rul1an"

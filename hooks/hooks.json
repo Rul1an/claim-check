@@ -1,5 +1,5 @@
 {
-  "description": "At the end of a turn, compare the agent's claims against what the session observed.",
+  "description": "At the end of a turn, report what the transcript can and cannot show about the claims in the agent's final message.",
   "hooks": {
     "Stop": [
       {

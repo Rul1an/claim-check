@@ -23,11 +23,16 @@ What the receipt is not:
     carry secrets. It is written with mode 0600 and is meant to stay on this machine.
 
 Exit code: pytest's own; 124 when the run was killed on timeout; 128+N when the child
-died on signal N; 64 when the run was refused or the arguments are unusable; 70 when
-the receipt could not be written.
+died on signal N; 64 when the run was refused or the arguments are unusable, before
+pytest starts; 70 when the receipt directory cannot be used, pytest cannot be started,
+or the receipt cannot be serialised or written.
 
-Stdlib only in this process. Python 3.9+. POSIX process groups are used for the
-timeout; on other systems only the direct child is killed.
+Stdlib only in this process. Python 3.9+. POSIX only: the working directory and the
+declared files are handled as POSIX paths, so on Windows every run is refused, and the
+timeout kills the child's process group.
+
+A receipt directory this creates gets mode 0700. One that exists keeps its permissions;
+it has to be a directory only you can write.
 """
 
 from __future__ import annotations
@@ -136,8 +141,10 @@ def _publish(receipt_dir, run_id, text):
     The bytes go to a temporary file in the same directory (mode 0600), which is
     flushed, fsynced and closed before the final name is created with a hard link. A
     link is atomic and fails when the name exists, so a partial receipt is never
-    visible under the final name and an existing receipt is never replaced. The
-    temporary file is removed whatever happens.
+    visible under the final name and an existing receipt is never replaced. That is
+    the guarantee, under ordinary filesystem semantics. Removing the temporary file
+    is best effort: a failing unlink is ignored, and a process killed outright can
+    leave a `.receipt-*.tmp` behind.
 
     This is about what a reader can see. It is not a promise about power loss: the
     directory itself is not fsynced, so a crash right after this returns can still
