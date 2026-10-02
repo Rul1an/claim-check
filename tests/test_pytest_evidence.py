@@ -101,6 +101,41 @@ class TestRunEntry(unittest.TestCase):
                 self.assertFalse(os.path.exists(receipts), timeout)
 
 
+class _PastEntry(Exception):
+    """Raised by the read sentinel: the entry check let the call through."""
+
+
+class TestRunEntryTimeoutRange(unittest.TestCase):
+    """An int too large for a float is not a usable timeout. Needs no pytest: nothing may launch."""
+
+    def call(self, timeout):
+        from unittest import mock
+        import pytest_evidence as pe
+        with tempfile.TemporaryDirectory() as tmp:
+            receipts = os.path.join(tmp, "receipts")
+            with mock.patch.object(pe.subprocess, "Popen", side_effect=AssertionError("launched")) as launch, \
+                    mock.patch.object(pe.ce, "snapshot_declared", side_effect=_PastEntry()) as read:
+                try:
+                    code = pe.run(receipts, ["src/calc.py"], ["-q"], timeout, 0, 10)
+                except _PastEntry:
+                    code = "past entry"
+                except Exception as exc:
+                    self.fail("run() raised %s for a timeout of %.20r" % (type(exc).__name__, timeout))
+            return code, read.call_count, launch.call_count, os.path.exists(receipts)
+
+    def test_an_int_too_large_for_a_float_is_refused_at_entry_without_an_exception(self):
+        for timeout in (10 ** 400, -(10 ** 400), 10 ** 309, 2 ** 1024):
+            self.assertEqual(self.call(timeout), (64, 0, 0, False), "10**%d" % (len(str(abs(timeout))) - 1))
+
+    def test_ordinary_finite_positive_timeouts_still_pass_the_entry_check(self):
+        for timeout in (60, 0.5, 600.0, 10 ** 6, 2 ** 63, 1e300):
+            self.assertEqual(self.call(timeout), ("past entry", 1, 0, False), repr(timeout))
+
+    def test_booleans_and_non_finite_values_are_still_refused(self):
+        for timeout in (True, False, float("nan"), float("inf"), float("-inf"), 0, -1, "60", None):
+            self.assertEqual(self.call(timeout), (64, 0, 0, False), repr(timeout))
+
+
 @unittest.skipUnless(HAVE_PYTEST, "pytest is not installed in this interpreter; these tests run real pytest")
 class RunnerCase(unittest.TestCase):
     def setUp(self):

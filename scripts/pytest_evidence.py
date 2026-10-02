@@ -185,8 +185,16 @@ def _kill(proc):
 
 def _limits_ok(timeout, max_output_bytes, max_report_bytes):
     """A timeout that is not finite never ends the run and cannot be written as JSON."""
+    if type(timeout) not in (int, float):
+        return False
+    try:
+        seconds = float(timeout)
+    except OverflowError:
+        # An int beyond the float range. The wait uses float arithmetic, so it is no
+        # more usable as a timeout than infinity is.
+        return False
     return (
-        type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0
+        math.isfinite(seconds) and seconds > 0
         and type(max_output_bytes) is int and max_output_bytes >= 0
         and type(max_report_bytes) is int and max_report_bytes >= 0
     )
