@@ -53,13 +53,30 @@ def pytest_collection_finish(session):
     _emit({"event": "selected", "nodeids": [item.nodeid for item in session.items]})
 
 
+def _is_xfail(report):
+    """True for an xfail, an xpass, and a strict xpass.
+
+    pytest marks the first two with `wasxfail`. A strict xpass gets no such mark: pytest
+    turns the passing call into a failure whose `longrepr` is the plain string
+    "[XPASS(strict)] <reason>". An ordinary failure carries a traceback object there,
+    not a string, so a test that fails with that text in its message is not matched.
+    This reads pytest's own wording, which is the only trace a strict xpass leaves in
+    a report; a pytest that words it differently would be recorded as a plain failure.
+    """
+    if hasattr(report, "wasxfail"):
+        return True
+    longrepr = report.longrepr
+    return report.when == "call" and report.outcome == "failed" and type(longrepr) is str \
+        and longrepr.startswith("[XPASS(strict)]")
+
+
 def pytest_runtest_logreport(report):
     _emit({
         "event": "phase",
         "nodeid": report.nodeid,
         "when": report.when,
         "outcome": report.outcome,
-        "xfail": hasattr(report, "wasxfail"),
+        "xfail": _is_xfail(report),
     })
 
 

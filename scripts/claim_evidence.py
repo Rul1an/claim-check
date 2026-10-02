@@ -462,6 +462,12 @@ def _assess_receipt(claim: dict, receipt: dict, check_current: Callable[[str, li
     if reasons:
         return "insufficient", reasons, scope
 
+    # Before the exit code is looked at: an item marked xfail (expected failure, unexpected
+    # pass, or a strict unexpected pass, which pytest reports as a failure) decides nothing
+    # about "every selected item passed", in either direction, whatever the other items did.
+    if any(x for n in view["selected"] for _, x in view["phases"].get(n, {}).values()):
+        return "insufficient", ["xfail_or_xpass"], scope
+
     failed = [n for n in view["selected"] if any(o == "failed" for o, _ in view["phases"].get(n, {}).values())]
     if exit_code == 1:
         if not failed:
@@ -474,9 +480,7 @@ def _assess_receipt(claim: dict, receipt: dict, check_current: Callable[[str, li
             return "insufficient", ["no_tests_selected"], scope
         for n in view["selected"]:
             phases = view["phases"].get(n, {})
-            if any(x for _, x in phases.values()):
-                reasons.append("xfail_or_xpass")
-            elif any(o == "skipped" for o, _ in phases.values()):
+            if any(o == "skipped" for o, _ in phases.values()):
                 reasons.append("skipped")
             elif set(phases) != set(_PHASES):
                 reasons.append("missing_phase")

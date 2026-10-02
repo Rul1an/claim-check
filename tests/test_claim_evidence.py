@@ -216,6 +216,25 @@ class TestInsufficient(unittest.TestCase):
         self.check(lambda r: events_of(r)[3].update(outcome="skipped", xfail=True), "xfail_or_xpass")
         self.check(lambda r: events_of(r)[3].update(xfail=True), "xfail_or_xpass")
 
+    def test_a_failed_phase_marked_xfail_is_not_a_failure_of_the_claim(self):
+        """What the capture plugin records for a strict XPASS: failed, xfail true, exit 1."""
+        def strict_xpass(r):
+            events_of(r)[3].update(outcome="failed", xfail=True)
+            events_of(r)[-1]["exitstatus"] = 1
+            r["process"]["exit_code"] = 1
+        r = passing_receipt()
+        strict_xpass(r)
+        out = ce.assess(claim(), [r])
+        self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["xfail_or_xpass"]))
+        # Beside an ordinary failure of the other item, the xfail item still decides.
+        events_of(r)[6].update(outcome="failed")
+        out = ce.assess(claim(), [r])
+        self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["xfail_or_xpass"]))
+        # Without the mark, the same receipt is an ordinary failure.
+        events_of(r)[3].update(xfail=False)
+        out = ce.assess(claim(), [r])
+        self.assertEqual((out["verdict"], out["reasons"]), ("contradicted", ["selected_item_failed"]))
+
     def test_identity_that_does_not_bind(self):
         self.check(lambda r: r.update(schema="claim-check.pytest-receipt.v2"), "unsupported_schema")
         self.check(lambda r: events_of(r)[0].update(run_id="run-0002"), "run_id_mismatch")

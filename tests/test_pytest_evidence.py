@@ -221,6 +221,36 @@ class TestOutcomes(RunnerCase):
             self.assertEqual(proc.returncode, 0, name)
             self.assertEqual((verdict, reasons), ("insufficient", ["xfail_or_xpass"]), name)
 
+    def test_strict_xpass_is_insufficient_although_pytest_reports_it_as_a_failure(self):
+        """pytest gives a strict XPASS a failed call phase and exit 1, with no `wasxfail`."""
+        self.write("test_sx.py", "import pytest\n\n@pytest.mark.xfail(strict=True)\ndef test_unexpected_pass():\n    assert True\n")
+        proc, verdict, reasons, receipt = self.verdict(["-q", "test_sx.py"])
+        self.assertEqual(proc.returncode, 1)
+        calls = [(e["outcome"], e["xfail"]) for e in receipt["report"]["events"]
+                 if e["event"] == "phase" and e["when"] == "call"]
+        self.assertEqual(calls, [("failed", True)])
+        self.assertEqual((verdict, reasons), ("insufficient", ["xfail_or_xpass"]))
+
+    def test_an_xfail_marked_item_beside_a_real_failure_is_insufficient(self):
+        """The documented rule comes first: a receipt with any xfail or xpass item decides nothing."""
+        real_failure = "\ndef test_really_fails():\n    assert 1 == 2\n"
+        for name, marked in (("test_mixed_strict.py", "@pytest.mark.xfail(strict=True)\ndef test_m():\n    assert True\n"),
+                             ("test_mixed_xfail.py", "@pytest.mark.xfail\ndef test_m():\n    assert False\n"),
+                             ("test_mixed_xpass.py", "@pytest.mark.xfail\ndef test_m():\n    assert True\n")):
+            self.write(name, "import pytest\n\n" + marked + real_failure)
+            proc, verdict, reasons, _ = self.verdict(["-q", name])
+            self.assertEqual(proc.returncode, 1, name)
+            self.assertEqual((verdict, reasons), ("insufficient", ["xfail_or_xpass"]), name)
+
+    def test_an_ordinary_failure_is_contradicted_whatever_its_message_says(self):
+        """A real assertion failure whose message imitates pytest's strict-XPASS text."""
+        self.write("test_spoof.py", "def test_spoof():\n    assert False, '[XPASS(strict)] not really'\n\n"
+                                    "def test_raises():\n    raise RuntimeError('[XPASS(strict)] ')\n")
+        proc, verdict, reasons, receipt = self.verdict(["-q", "test_spoof.py"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual([e["xfail"] for e in receipt["report"]["events"] if e["event"] == "phase"], [False] * 6)
+        self.assertEqual((verdict, reasons), ("contradicted", ["selected_item_failed"]))
+
     def test_timeout_kills_the_run_and_is_insufficient(self):
         self.write("test_slow.py", "import time\n\ndef test_slow():\n    time.sleep(60)\n")
         start = time.time()
