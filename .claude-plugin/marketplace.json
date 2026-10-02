@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "claim-check",
-  "description": "Verification hooks for agentic coding: check what the agent said it did against what the session observed.",
+  "description": "Verification hooks for agentic coding: report what a session transcript can and cannot show about what the agent said it did, and check a scoped test claim against a pytest receipt.",
   "owner": {
     "name": "Rul1an",
     "url": "https://github.com/Rul1an"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "claim-check",
-      "description": "It told you the tests passed. Did they run? Compares the claims in the agent's final message against the tool calls the session actually observed, and speaks up only when they disagree. Report-only by default, silent when everything checks out.",
+      "description": "It told you the tests passed. What is that based on? Reports what the transcript can and cannot show about each claim in the agent's final message, and checks a scoped test claim against an opt-in pytest receipt. Report-only.",
       "author": {
         "name": "Rul1an",
         "url": "https://github.com/Rul1an"
@@ -17,7 +17,7 @@
       "category": "testing",
       "source": "./",
       "homepage": "https://github.com/Rul1an/claim-check",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "keywords": [
         "hooks",
         "verification",

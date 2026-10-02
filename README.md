@@ -1,24 +1,30 @@
 # claim-check
 
-**It told you the tests passed. Did they run?**
+**It told you the tests passed. What is that based on?**
 
-A Claude Code plugin that compares what the agent *said it did* against what the session *actually
-observed*, and speaks up only when they disagree.
+A Claude Code plugin with two separate parts:
+
+1. A **Stop hook** that reads the final message, finds the claims in it, and says what the session
+   transcript can and cannot show about each one. It never confirms a claim and never refutes one.
+2. An **opt-in pytest runner** that writes a receipt of one run, and a checker that compares a
+   precisely scoped claim with that receipt. This is the only place a `supported` or
+   `contradicted` verdict comes from.
 
 ```
-claim-check — what was said vs what this session observed
+claim-check — what the final message claims, and what this transcript can show
 
-  contradicted  all tests pass
-                no test command was observed in this session
-  contradicted  claimed a commit
-                no `git commit` was observed
+  insufficient  All tests pass
+                1 tool request naming a test runner was seen. A request is not a result,
+                and this hook does not evaluate tool results: nothing here binds an exit
+                code or a report to the claim.
+  unchecked     claimed a commit
+                no shell-tool request was seen. That does not show it did not happen:
+                hooks, subagents, scripts and your own shell are not in view.
 
-  note: claim-check sees tool calls, not their effects: a shell redirect or a
-        subprocess can change files with no trace here. Absence of an
-        observation is not proof of absence.
+  note: claim-check counts tool requests in the transcript. It does not evaluate their
+        results or effects. It cannot confirm or refute a claim. The labels above
+        describe what was checkable here, not whether the claim is true.
 ```
-
-Silent when everything checks out. Report-only by default; it never blocks unless you ask it to.
 
 ## Install
 
@@ -27,119 +33,201 @@ Silent when everything checks out. Report-only by default; it never blocks unles
 /plugin install claim-check@claim-check
 ```
 
-Works in the Claude Code CLI and the desktop app — both read the same settings tree, so one install
-covers both. Python 3.9+, standard library only, no network calls, no configuration, no telemetry.
+Works in the Claude Code CLI and the desktop app. The hook needs Python 3.9+ and nothing else: no
+network calls, no configuration, no telemetry. The runner needs pytest in the interpreter you start
+it with. The runner and the checker are POSIX-only: the working directory and declared files are
+handled as POSIX paths, and on Windows every run is refused.
 
 ## Why
 
-Agents claim completion they have not earned, and the cause is structural rather than a bug:
-training on human feedback rewards answers that sound finished. "All tests pass" lands well whether
-or not a test ran. The fix is not a better prompt — it is checking the claim against something
-outside the model's own account of itself.
+Agents claim completion they have not earned, and the cause is structural: training on human
+feedback rewards answers that sound finished. "All tests pass" lands well whether or not a test
+ran. The useful question is what the claim rests on, and the answer has to come from somewhere
+other than the model's own account.
 
-That is the whole plugin. At the end of a turn it reads the session transcript, extracts the
-confident statements from the final message, and checks each against the tool calls that actually
-happened.
+## Four verdicts
 
-## What it checks
+| Verdict | Meaning | Where it can come from |
+|---|---|---|
+| `supported` | a receipt, bound to the claim's exact scope, records every selected test passing | the checker only |
+| `contradicted` | a receipt, bound to the same scope, records a selected test failing | the checker only |
+| `insufficient` | there is something to look at, and it does not decide the claim | hook and checker |
+| `unchecked` | nothing here can assess this kind of claim | hook and checker |
 
-| Claim in the final message | Checked against |
-|---|---|
-| "all tests pass", "the suite is green" | did a recognised test command run? pytest · cargo test · go test · npm/pnpm/yarn/bun test · jest · vitest · mocha · playwright · rspec · phpunit · gradle/maven · `make test` · `python -m unittest` · a test file run directly |
-| "I ran the tests" | same |
-| "I committed" | was there a `git commit`? |
-| "I pushed" | was there a `git push`? |
-| "I updated `path`" | was `path` edited by an editing tool, or named in a shell command? |
-| "I did not touch `path`" | was `path` edited anyway? |
+## Part 1: the Stop hook
 
-Everything else is left alone on purpose.
+At the end of a turn the hook reads the transcript and takes the final assistant message. Finding
+claims in prose is heuristic; what it says about each claim is fixed by rule.
 
-## Three outcomes, never two
+| Claim in the final message | Verdict | What the report states |
+|---|---|---|
+| "all tests pass", "the test suite passes", "I ran the tests" | `insufficient` | how many tool requests named a test runner |
+| "I committed", "I pushed" | `unchecked` | how many shell-tool requests were seen; their text is not read |
+| "I updated `path`", "I did not touch `path`" | `unchecked` | how many editing-tool requests named a path ending in `path` |
 
-**contradicted** — the claim disagrees with what was observed. A test command either ran or it did
-not.
+The hook counts tool *requests*. It does not evaluate tool results, even where the transcript
+carries an exit code or a test summary: nothing in the hook binds such a result to a claim. And a
+transcript does not show what a hook, a subagent, a script or your own shell did. So:
 
-**unobservable** — the claim is about something this session cannot see. Reported as such rather
-than quietly counted as fine.
+- A request that was seen does not confirm anything. `echo pytest` names a test runner.
+- A request that was not seen does not refute anything. Tests can run where the hook cannot look.
+- Every recognised claim is reported. Silence means no claim was recognised, not that one checked
+  out.
 
-**confirmed** — matched. Not printed; a tool that congratulates you every turn becomes noise, and
-noise gets uninstalled.
+The hook is report-only. `CLAIM_CHECK_ENFORCE`, which made 0.2.0 hand contradicted claims back to
+the agent, is ignored: the hook has no verdict it could block on.
 
-The distinction between *contradicted* and *unobservable* is the point. A checker with only two
-states has to pretend that "I saw nothing" means "nothing happened" — which is the exact overclaim
-this plugin exists to catch. That rule applies to its own output too.
+### Limits of the hook
 
-## Limits, stated up front
+- **Claim detection is heuristic and English-only.** Hedged, conditional and instruction-shaped
+  sentences are dropped. A message in another language is reported as unchecked, once per session.
+- **Negation is a word rule.** A claim is dropped when `nothing`, `none`, `neither`, `nor` or `no`
+  comes before it in its sentence, so "Nothing was edited, committed or pushed" is not a commit
+  claim. The same rule drops "There was no reason to wait, so I committed". A dropped claim costs
+  one line of report.
+- **Only the current final message is assessed.** If a user turn or a tool request follows the
+  last prose in the transcript, the hook says nothing.
+- **Command text never reaches the report or the log.** Counts and the claimed sentence do.
+- Requires `python3` on PATH. Untested on native Windows.
 
-Hooks see **tool calls, not their effects**. A `bash -c` that spawns a subprocess can write files,
-open sockets and edit configuration with nothing visible at this layer.
+## Part 2: a pytest receipt, and a claim scoped to it
 
-- A missing observation is **not** proof that nothing happened. The note in every report says so,
-  and it is not removable.
-- File claims are only *contradicted* when an editing tool ran and the named path was not among its
-  targets. With no editing tool at all, the verdict is *unobservable*.
-- **Claim patterns are English-only.** A final message in another language is reported as
-  *unchecked*, once per session — never silently treated as clean.
-- Claim detection is conservative by design. Hedged, conditional and instruction-shaped sentences
-  are dropped, so it misses real claims rather than inventing false ones.
-- The transcript is written asynchronously. If the last message has not landed after a short wait,
-  the plugin says nothing rather than judging a stale turn.
-- Requires `python3` on PATH. Untested on native Windows, where the launcher is `py`.
-
-## How it was tested
-
-Synthetic fixtures were not enough, and saying so is the honest part of the record. The plugin was
-run against **113 real Claude Code transcripts** and then installed live as a `Stop` hook. Each pass
-found a class of defect the previous one could not:
-
-| Found by | Defect |
-|---|---|
-| Unit tests | a greedy regex captured `s.py` out of `src/secrets.py`; conditional prose read as a claim |
-| Real transcripts | markdown tables and links read as claims; `"I haven't committed"` reported as a *missing* commit; a third party's `"Aegis pushed again"` read as the agent's own claim |
-| Its own live run | `python3 tests/test_x.py` not recognised as running tests — the way this very project runs its own suite |
-| The live log | nine silent runs that looked clean were **unchecked**, not clean: that session was not in English |
-
-Current state: **45 tests**, zero false positives across 113 real transcripts, and 12 of 12 mutants
-caught — take a real session that legitimately claimed a passing suite, remove the test command from
-its observations, and require the checker to notice.
-
-The 45 tests are the reproducible part, and they are what CI runs on every push:
+Nothing here runs unless you start it.
 
 ```bash
-python3 tests/test_claim_check.py
+python3 scripts/pytest_evidence.py run \
+  --receipt-dir .claim-check/receipts \
+  --declare src/calc.py --declare pyproject.toml \
+  -- -q tests/test_calc.py
 ```
 
-The transcript numbers are not reproducible by anyone else: they come from private local sessions
-that cannot be shared. Treat them as a statement about how this was developed, not as evidence you
-can check. If you point it at your own transcripts and it gets something wrong, that is a bug report
-worth more than the number.
+The runner starts `python -m pytest` as an argument vector, with no shell, waits for it, and writes
+`<receipt-dir>/<run_id>.json`. It prints one line with the receipt path, the run id, the selection
+digest and the declared-file digest. Pytest's own output goes to stderr, capped at
+`--max-output-bytes`; the child is still read to the end. `--timeout` (default 600 s, a positive
+finite number) kills the run.
 
-## Enforce mode (off by default)
+Runner exit codes: pytest's own when pytest ran to its end; 124 when the run was killed on timeout;
+128+N when the child died on signal N; 64 when the run was refused or the arguments are unusable,
+before pytest starts; 70 when the receipt directory cannot be used, pytest cannot be started, or
+the receipt cannot be serialised or written. After 64 or 70 there is no receipt and no summary
+line. 70 can also follow a pytest run that finished.
+
+The receipt appears under `<run_id>.json` only once it is complete: it is written to a temporary
+file in the same directory, flushed, synced and closed, and then linked to its final name, which
+fails if that name exists. A write that fails leaves nothing under the final name. Removing the
+temporary file is best effort; a run killed outright can leave a `.receipt-*.tmp` behind. This is
+about what a reader can see, not about power loss: the directory is not synced.
+
+A receipt records:
+
+- **what the runner observed itself**: argv, working directory, start and end time, the exit code
+  or signal it waited for, whether it killed the run;
+- **what pytest reported inside the child**: the selected node ids and every setup, call and
+  teardown outcome, collection errors, deselection, the session's exit status;
+- **declared files**: each `--declare` file's SHA-256 and size, read before the run and again
+  after it.
+
+Then state a claim with its scope and check it:
+
+```json
+{
+  "kind": "recorded_selection_passed",
+  "run_id": "…",
+  "selection_digest": "sha256:…",
+  "declared_files_digest": "sha256:…"
+}
+```
 
 ```bash
-export CLAIM_CHECK_ENFORCE=1
+python3 scripts/claim_evidence.py assess --claim claim.json --receipt .claim-check/receipts/<run_id>.json
 ```
 
-Contradicted claims are handed back to the agent, which then goes and does the thing it said it did.
-Useful, and interrupting. Off unless you turn it on, because a check that fires on a normal turn
-gets disabled within a day.
+It prints the assessment as JSON. Exit code 0 `supported`, 1 `contradicted`, 2 `insufficient`,
+3 `unchecked`, 64 unusable arguments.
+
+Two claim kinds:
+
+- `recorded_selection_passed` — every item of this selection passed in this run, and the declared
+  files were the same before and after it. About the run, not about now.
+- `recorded_selection_passed_current_files` — the same, and the declared files, re-read when you
+  ask, still match. Edit a declared file and this becomes `insufficient`.
+
+`supported` needs all of this: one receipt for the run; run id, selection digest and declared-file
+digest equal to the claim's; the process completed with exit code 0 and pytest's own exit status
+agrees; exactly one session start, one selection and one session finish, with the selection before
+any test phase; at least one selected item; every selected item with setup, call and teardown
+recorded once each, in that order, as passed; no skip and no xfail-marked item; no collection error; the
+launch argv, working directory and declared paths present and well-formed.
+
+`contradicted` needs the same binding, exit code 1, a selected item with a failed phase, and no
+xfail-marked item anywhere in the selection.
+
+An xfail-marked item, whether it failed as expected, passed unexpectedly, or passed under
+`strict=True` (which pytest itself reports as a failure with exit code 1), makes the receipt
+`insufficient`, also when another item really failed. The strict case is recognised by the text
+pytest puts in its report, `[XPASS(strict)]`; there is no other mark for it.
+
+Everything else is `insufficient`, with reason codes: no tests collected, a skip, an xfail, a
+collection error, a timeout, a missing or cut report, an unknown, repeated or mistyped report
+line, a repeated, missing or out-of-order phase, a key stated twice in a receipt or a report line,
+input that is not valid UTF-8 JSON or nests more than 16 levels, an exit status that differs from the process exit code, a
+different run, selection or declared-file identity, a declared file that changed, went missing or
+became a symlink. Two different receipts for the same run are both listed and neither is used.
+
+Digests, so you can recompute them: `selection_digest` is the SHA-256 of the sorted node ids as
+compact JSON; `declared_files_digest` is the SHA-256 of the sorted `[path, sha256, size]` triples
+as compact JSON.
+
+### Limits of a receipt
+
+- **A receipt is not authenticated.** The agent runs as you and can write any file you can. A
+  hand-written receipt that is consistent with itself is accepted. `supported` means "consistent
+  with what this runner records", not "this happened". The checker catches a receipt that
+  contradicts itself and two receipts that disagree. It catches nothing else.
+- **A passing selection is not "all tests pass".** The checker assesses a selection named by its
+  node ids. It is never attached to a sentence in a message, and the hook does not read receipts.
+  A run of one test supports a claim about that one test.
+- **The snapshot's path checks are not a sandbox.** Refusing symlinks and `..` is a check on the
+  path as it was when each file was read. Another process that swaps a directory or a file between
+  the check and the read, or between the two reads, is not detected.
+- **Declared files are a comparison of snapshots of the files you named.** They are not the bytes
+  pytest loaded: imports from outside the list, bytecode caches, installed packages and a file
+  edited and restored between the two reads are all outside it. The two reads are not atomic.
+- **A result depends on things no receipt binds**: environment variables (only the names of a
+  few pytest-related ones are recorded, never values), the network, the clock, test order.
+- **A receipt is private, if its directory is.** It holds the pytest arguments and paths, which
+  can carry secrets. The file is written with mode 0600 and nothing sends it anywhere. A receipt
+  directory the runner creates gets mode 0700; one that already exists keeps the permissions it
+  has, and the runner does not change them. Give it a directory only you can write: mode 0600 on
+  the file does not stop someone who can write the directory from replacing the file.
+- Plugins that move reporting out of the pytest process, such as pytest-xdist, are not handled;
+  expect `insufficient`. Reruns repeat a phase and are `insufficient` too.
+- The timeout kills the child's process group. A process that leaves that group outlives it.
+
+## Tests
+
+```bash
+python3 tests/test_claim_check.py        # the hook; stdlib only
+python3 tests/test_claim_evidence.py     # the checker; stdlib only
+python3 tests/test_pytest_evidence.py    # the runner; needs pytest, runs real pytest subprocesses
+```
+
+The runner tests cover a pass, an assertion failure, a teardown failure, a collection error, zero
+tests, a skip, xfail and xpass, a timeout, and a process whose exit code disagrees with what pytest
+reported.
+
+0.2.0 said `contradicted` when no matching command appeared in the transcript and counted a
+matching command as confirmation. Both were wrong for the reasons under Part 1, and 0.3.0 removes
+them. 0.2.0's README also reported zero false positives across private transcripts; that figure
+is withdrawn. It was not reproducible by anyone else, and the verdict it measured no longer exists.
 
 ## Troubleshooting
 
-Set `CLAIM_CHECK_LOG=/tmp/claim-check.jsonl` to append one line per run: how much of the final
-message was read, how many commands and edits were observed, how many claims were recognised, and
-what was reported. A silent hook and a broken hook look identical without it.
-
-## Roadmap
-
-- **Codex.** The design already targets the hook events both harnesses share. Codex observes shell
-  commands, so the command-shaped claims port directly; file-edit claims will report *unobservable*
-  there until its hook surface covers edits.
-- More claim classes, one at a time, and only where they can be checked deterministically.
-- Optional: write the claim/observation pairs out as a record for people who want to keep them.
-
-Issues and pull requests welcome, particularly new false-positive cases — a real transcript this
-gets wrong is the most useful thing you can send.
+Set `CLAIM_CHECK_LOG=/tmp/claim-check.jsonl` to append one line per hook run: whether a current
+final message was found, how many requests of each kind were counted, how many claims were
+recognised, and each verdict. No command text. A silent hook and a broken hook look identical
+without it.
 
 ## Built by
 
