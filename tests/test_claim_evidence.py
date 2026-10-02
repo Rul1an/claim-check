@@ -334,6 +334,150 @@ class TestStoredIdentityAndOrder(unittest.TestCase):
                 ce.snapshot_declared(os.path.realpath(tmp), ["bad\x00.py"])
 
 
+class TestEventFields(unittest.TestCase):
+    """Each event type has an exact member set and typed members.
+
+    One change per case to a receipt that is otherwise supported, and the reason must be
+    exactly the event-level one: a later check that happens to refuse the same receipt
+    for another reason does not count.
+    """
+
+    def reasons(self, change):
+        r = passing_receipt()
+        change(r)
+        out = ce.assess(claim(), [r], check_current=unreachable)
+        self.assertEqual(out["verdict"], "insufficient")
+        return out["reasons"]
+
+    def test_session_start_members(self):
+        self.assertEqual(self.reasons(lambda r: events_of(r)[0].update(hostname="h")), ["malformed_report_event"])
+        for member in ("run_id", "pytest_version", "python_version", "rootdir"):
+            for value in (7, None, ["9.1.1"], True):
+                self.assertEqual(self.reasons(lambda r: events_of(r)[0].update({member: value})),
+                                 ["malformed_report_event"], (member, value))
+        for value in (7, False, ["pytest.ini"]):
+            self.assertEqual(self.reasons(lambda r: events_of(r)[0].update(inifile=value)),
+                             ["malformed_report_event"], value)
+        for value in ("-q", [1], None):
+            self.assertEqual(self.reasons(lambda r: events_of(r)[0].update(invocation_args=value)),
+                             ["malformed_report_event"], value)
+
+    def test_session_start_with_a_configuration_file_is_valid(self):
+        r = passing_receipt()
+        events_of(r)[0]["inifile"] = "/work/project/pytest.ini"
+        self.assertEqual(ce.assess(claim(), [r], check_current=unreachable)["verdict"], "supported")
+
+    def test_collect_error_members(self):
+        for event in ({"event": "collect_error", "nodeid": "tests/test_c.py", "longrepr": "x"},
+                      {"event": "collect_error", "nodeid": 3}, {"event": "collect_error", "nodeid": None},
+                      {"event": "collect_error"}):
+            self.assertEqual(self.reasons(lambda r: events_of(r).insert(1, event)), ["malformed_report_event"], event)
+
+    def test_selection_and_deselection_members(self):
+        for name in ("selected", "deselected"):
+            index = 1 if name == "selected" else 2
+            for event in ({"event": name, "nodeids": list(NODES), "count": 2}, {"event": name, "nodeids": [3]},
+                          {"event": name, "nodeids": [None]}, {"event": name, "nodeids": [["a"]]},
+                          {"event": name, "nodeids": "tests/test_a.py::test_one"}, {"event": name}):
+                def change(r, event=event):
+                    if name == "selected":
+                        events_of(r)[1] = event
+                    else:
+                        events_of(r).insert(index, event)
+                self.assertEqual(self.reasons(change), ["malformed_report_event"], event)
+
+    def test_phase_members(self):
+        for member, value in (("nodeid", 3), ("nodeid", None), ("nodeid", [NODES[0]]), ("when", 1), ("when", "run"),
+                              ("outcome", "ok"), ("outcome", None), ("xfail", 0), ("xfail", "false"), ("xfail", None)):
+            self.assertEqual(self.reasons(lambda r: events_of(r)[2].update({member: value})),
+                             ["malformed_report_event"], (member, value))
+        self.assertEqual(self.reasons(lambda r: events_of(r)[2].update(duration=0.1)), ["malformed_report_event"])
+
+    def test_session_finish_members(self):
+        self.assertEqual(self.reasons(lambda r: events_of(r)[-1].update(duration=1.5)), ["malformed_report_event"])
+        for value in (False, "0", None, 0.0):
+            self.assertEqual(self.reasons(lambda r: events_of(r)[-1].update(exitstatus=value)),
+                             ["malformed_report_event"], value)
+
+    def test_session_start_must_come_first_and_session_finish_last(self):
+        def start_after_selection(r):
+            ev = events_of(r)
+            r["report"]["events"] = [ev[1], ev[0]] + ev[2:]
+
+        def start_after_a_deselection(r):
+            events_of(r).insert(0, {"event": "deselected", "nodeids": []})
+
+        def finish_before_the_last_phase(r):
+            ev = events_of(r)
+            r["report"]["events"] = ev[:7] + [ev[8], ev[7]]
+
+        for change in (start_after_selection, start_after_a_deselection, finish_before_the_last_phase):
+            self.assertEqual(self.reasons(change), ["report_out_of_order"], change.__name__)
+
+    def test_a_phase_without_its_setup_is_out_of_order(self):
+        def teardown_only(r):
+            ev = events_of(r)
+            r["report"]["events"] = ev[:2] + [ev[4]] + ev[5:]
+
+        def call_and_teardown_only(r):
+            ev = events_of(r)
+            r["report"]["events"] = ev[:2] + ev[3:]
+
+        self.assertEqual(self.reasons(teardown_only), ["phase_out_of_order"])
+        self.assertEqual(self.reasons(call_and_teardown_only), ["phase_out_of_order"])
+
+
+class TestLegitimateStreams(unittest.TestCase):
+    """Streams pytest really writes. A check that grows too strict must fail one of these."""
+
+    def verdict(self, r, c=None):
+        out = ce.assess(c or claim(), [r], check_current=unreachable)
+        return out["verdict"], out["reasons"]
+
+    def test_deselected_items_before_the_selection(self):
+        r = passing_receipt()
+        events_of(r).insert(1, {"event": "deselected", "nodeids": ["tests/test_a.py::test_three"]})
+        self.assertEqual(self.verdict(r), ("supported", ["all_selected_items_passed"]))
+
+    def test_a_collection_error_is_reported_as_such(self):
+        r = passing_receipt()
+        events_of(r).insert(1, {"event": "collect_error", "nodeid": "tests/test_broken.py"})
+        events_of(r)[-1]["exitstatus"] = 2
+        r["process"]["exit_code"] = 2
+        self.assertEqual(self.verdict(r), ("insufficient", ["collection_error"]))
+
+    def test_a_skip_decided_in_setup_has_no_call_phase(self):
+        r = passing_receipt()
+        ev = events_of(r)
+        ev[2]["outcome"] = "skipped"
+        r["report"]["events"] = ev[:3] + ev[4:]
+        self.assertEqual(self.verdict(r), ("insufficient", ["skipped"]))
+
+    def test_a_skip_raised_inside_the_test_has_all_three_phases(self):
+        r = passing_receipt()
+        events_of(r)[3]["outcome"] = "skipped"
+        self.assertEqual(self.verdict(r), ("insufficient", ["skipped"]))
+
+    def test_a_run_stopped_at_the_first_failure_leaves_later_items_without_phases(self):
+        r = failing_receipt()                       # item two fails in call
+        ev = events_of(r)
+        r["report"]["events"] = ev[:2] + ev[5:]     # item one was never reached
+        self.assertEqual(self.verdict(r), ("contradicted", ["selected_item_failed"]))
+
+    def test_collection_without_running_selects_items_and_records_no_phase(self):
+        r = passing_receipt()
+        ev = events_of(r)
+        r["report"]["events"] = ev[:2] + [ev[-1]]
+        self.assertEqual(self.verdict(r), ("insufficient", ["missing_phase"]))
+
+    def test_a_receipt_for_another_run_beside_the_right_one_is_ignored(self):
+        other = failing_receipt()
+        other["run_id"] = "run-0002"
+        events_of(other)[0]["run_id"] = "run-0002"
+        out = ce.assess(claim(), [other, passing_receipt()], check_current=unreachable)
+        self.assertEqual((out["verdict"], len(out["evidence"])), ("supported", 1))
+
+
 class TestReceiptSets(unittest.TestCase):
     def test_a_receipt_for_another_run_is_not_evidence(self):
         r = passing_receipt()
