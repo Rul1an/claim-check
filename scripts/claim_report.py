@@ -52,8 +52,9 @@ MAX_EVIDENCE = 8
 MAX_COUNT = 10 ** 15
 
 _VERDICTS = ("supported", "contradicted", "insufficient", "unchecked")
-_REASON_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
-_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Used with fullmatch(): `$` with match() also accepts the string followed by one newline.
+_REASON_CODE = re.compile(r"[a-z0-9_]{1,64}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _SCOPE_KEYS = {"run_id", "cwd", "selection_digest", "selected_count", "declared_files_digest", "declared_file_count"}
 
 
@@ -168,12 +169,12 @@ def _checked(assessment: Any) -> dict:
     elif assessment["limits"] != ce.LIMITS:
         problem = "limits"
     elif type(assessment["reasons"]) is not list or not all(
-        type(r) is str and _REASON_CODE.match(r) for r in assessment["reasons"]
+        type(r) is str and _REASON_CODE.fullmatch(r) for r in assessment["reasons"]
     ):
         problem = "reasons"
     elif type(assessment["evidence"]) is not list or not all(
         type(e) is dict and set(e) == {"receipt_sha256"} and type(e["receipt_sha256"]) is str
-        and _DIGEST.match(e["receipt_sha256"]) for e in assessment["evidence"]
+        and _DIGEST.fullmatch(e["receipt_sha256"]) for e in assessment["evidence"]
     ):
         problem = "evidence"
     elif not ce.json_value_ok(assessment["claim_kind"]):
@@ -183,7 +184,7 @@ def _checked(assessment: Any) -> dict:
         if type(scope) is not dict or (scope and (
             set(scope) != _SCOPE_KEYS
             or type(scope["run_id"]) is not str or type(scope["cwd"]) is not str
-            or not all(type(scope[k]) is str and _DIGEST.match(scope[k]) for k in ("selection_digest", "declared_files_digest"))
+            or not all(type(scope[k]) is str and _DIGEST.fullmatch(scope[k]) for k in ("selection_digest", "declared_files_digest"))
             or not all(type(scope[k]) is int and scope[k] >= 0 for k in ("selected_count", "declared_file_count"))
         )):
             problem = "scope"

@@ -220,6 +220,33 @@ class TestRendererInput(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cr.render_report(not_a_dict)
 
+    def test_a_trailing_newline_does_not_pass_as_a_code_or_a_digest(self):
+        """`$` also matches before a final newline, so `timed_out\\n` passed `^...$` with match()."""
+        def base():
+            return assessment("insufficient", reasons=["timed_out"], scope=scope(), evidence=[D1])
+        changes = {
+            "reason with a trailing newline": lambda a: a.update(reasons=["timed_out\n"]),
+            "evidence digest with a trailing newline": lambda a: a.update(evidence=[{"receipt_sha256": D1 + "\n"}]),
+            "selection digest with a trailing newline": lambda a: a["scope"].update(selection_digest=D1 + "\n"),
+            "declared digest with a trailing newline": lambda a: a["scope"].update(declared_files_digest=D2 + "\n"),
+        }
+        accepted = []
+        for name, change in changes.items():
+            a = base()
+            change(a)
+            try:
+                cr.render_report(a)
+            except ValueError:
+                continue
+            accepted.append(name)
+        self.assertEqual(accepted, [])
+        # Controls: the same values without the newline are accepted and printed as they are.
+        text = cr.render_report(base())
+        self.assertIn('Reasons: ["timed_out"]\n', text)
+        self.assertIn('Evidence: ["' + D1 + '"]\n', text)
+        self.assertIn('"selection_digest": "' + D1 + '"', text)
+        self.assertIn('"declared_files_digest": "' + D2 + '"', text)
+
     def test_every_real_assessment_is_accepted(self):
         for a in (ce.assess(fx.claim(), [fx.passing_receipt()]), ce.assess(fx.claim(), [fx.failing_receipt()]),
                   ce.assess(fx.claim(), [fx.passing_receipt(), fx.failing_receipt()]), ce.assess(fx.claim(), []),
