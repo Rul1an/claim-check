@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import secrets
 import shutil
@@ -238,7 +239,8 @@ def run(receipt_dir, declare, pytest_args, timeout, max_output_bytes, max_report
     path = os.path.join(receipt_dir, run_id + ".json")
     try:
         # Serialised in full before the file exists, so a failure leaves no partial receipt.
-        text = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+        # allow_nan=False: `Infinity` and `NaN` are not JSON, and the checker refuses them.
+        text = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n"
     except (ValueError, RecursionError):
         sys.stderr.write("cannot serialise the receipt\n")
         return EXIT_INTERNAL
@@ -279,8 +281,9 @@ def main(argv=None):
     if args.command != "run":
         parser.print_usage(sys.stderr)
         return EXIT_USAGE
-    if not args.timeout > 0 or args.max_output_bytes < 0 or args.max_report_bytes < 0:
-        sys.stderr.write("refused: --timeout must be positive and the byte limits must not be negative\n")
+    if not (math.isfinite(args.timeout) and args.timeout > 0) or args.max_output_bytes < 0 or args.max_report_bytes < 0:
+        sys.stderr.write("refused: --timeout must be a positive, finite number of seconds and the byte limits "
+                         "must not be negative\n")
         return EXIT_USAGE
     pytest_args = args.pytest_args[1:] if args.pytest_args[:1] == ["--"] else args.pytest_args
     return run(args.receipt_dir, args.declare, pytest_args, args.timeout, args.max_output_bytes, args.max_report_bytes)

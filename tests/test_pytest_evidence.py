@@ -347,6 +347,26 @@ class TestReceiptFile(RunnerCase):
         self.assertEqual(ce.assess(claim, [edited])["reasons"], ["exit_status_mismatch"])
         self.assertEqual(ce.assess(claim, [receipt])["verdict"], "contradicted")
 
+    def test_a_timeout_that_is_not_a_finite_number_is_refused_before_pytest_starts(self):
+        """`inf` ran pytest with no limit and wrote `Infinity`, which the checker cannot read."""
+        self.write("test_marker.py", "def test_leaves_a_marker():\n    open('ran.marker', 'w').close()\n")
+        for value in ("inf", "Infinity", "-inf", "nan", "NaN"):
+            proc, summary, _ = self.run_runner(["-q", "test_marker.py"], extra=["--timeout", value])
+            self.assertEqual((proc.returncode, summary), (64, None), value)
+            self.assertFalse(os.path.exists(os.path.join(self.cwd, "ran.marker")), value)
+            self.assertFalse(os.path.exists(self.receipts), value)
+
+    def test_a_receipt_that_would_hold_a_non_finite_number_is_not_written(self):
+        """Second line of defence: called past the argument check, the runner refuses to
+        serialise `Infinity` and leaves no receipt."""
+        self.write("test_ok.py", PASSING)
+        code = ("import sys; sys.path.insert(0, %r); import pytest_evidence as pe; "
+                "sys.exit(pe.run(%r, ['src/calc.py'], ['-q', '-p', 'no:cacheprovider', 'test_ok.py'], "
+                "float('inf'), 1000, 10**6))" % (os.path.join(ROOT, "scripts"), self.receipts))
+        proc = subprocess.run([sys.executable, "-B", "-c", code], cwd=self.cwd, capture_output=True, text=True, timeout=120)
+        self.assertEqual((proc.returncode, proc.stdout), (70, ""), proc.stderr[-300:])
+        self.assertEqual([f for f in os.listdir(self.receipts) if not f.startswith(".")], [])
+
     def test_usage_errors_exit_64_without_a_receipt(self):
         self.write("test_ok.py", PASSING)
         for extra in (["--timeout", "0"], ["--timeout", "abc"], ["--max-output-bytes", "-1"]):
