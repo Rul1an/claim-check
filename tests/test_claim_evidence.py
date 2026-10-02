@@ -342,6 +342,27 @@ class TestReceiptSets(unittest.TestCase):
             out = ce.assess(claim(), [passing_receipt(), bad])
             self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", [reason]))
 
+    def test_a_receipt_object_that_is_not_a_json_value_is_unreadable_not_an_exception(self):
+        """assess() can be handed Python objects directly. Hashing one of these raised TypeError."""
+        class Opaque:
+            pass
+        not_json = [{1}, b"bytes", (1, 2), Opaque(), float("nan"), float("inf"), -float("inf")]
+        bad_receipts = [dict(passing_receipt(), extra=v) for v in not_json]
+        bad_receipts += [dict(passing_receipt(), **{"nested": {"deeper": [v]}}) for v in not_json[:2]]
+        for keys in ({1: 2}, {1: 2, "1": 3}, {None: 1}, {("a",): 1}, {True: 1}):
+            r = passing_receipt()
+            r["extra"] = keys
+            bad_receipts.append(r)
+        for bad in bad_receipts:
+            for receipts in ([bad], [passing_receipt(), bad], [bad, passing_receipt()]):
+                out = ce.assess(claim(), receipts)
+                self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["unreadable_receipt"]),
+                                 repr(bad.get("extra", bad.get("nested"))))
+
+    def test_a_claim_object_that_is_not_a_json_value_is_unchecked_or_insufficient_not_an_exception(self):
+        self.assertEqual(ce.assess({"kind": {1}}, [passing_receipt()])["verdict"], "unchecked")
+        self.assertEqual(ce.assess(claim(run_id=b"run-0001"), [passing_receipt()])["reasons"], ["scope_unspecified"])
+
     def test_an_edited_receipt_is_caught_only_where_it_contradicts_itself(self):
         """Flipping the exit code of a failing receipt leaves the failed phase behind."""
         r = failing_receipt()

@@ -88,8 +88,13 @@ def _is_number(x: Any) -> bool:
     return type(x) in (int, float) and x == x and x not in (float("inf"), float("-inf"))
 
 
-def depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
-    """True when no list or dict in `value` sits more than `limit` levels deep.
+def json_value_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
+    """True when `value` is a JSON value nested no more than `limit` levels deep.
+
+    A JSON value here is a dict with string keys, a list, a string, an int, a finite
+    float, a bool or None, by exact type. Anything else cannot be hashed the same way
+    twice or cannot be hashed at all: a set raises, and the key 1 would serialise as
+    the key "1".
 
     Walks with its own stack. How deep the JSON decoder or encoder can recurse
     differs between Python versions, so the limit is stated here and not left to them.
@@ -97,11 +102,19 @@ def depth_ok(value: Any, limit: int = MAX_JSON_DEPTH) -> bool:
     stack = [(value, 1)]
     while stack:
         item, depth = stack.pop()
-        if type(item) in (list, dict):
+        kind = type(item)
+        if kind in (list, dict):
             if depth > limit:
                 return False
-            children = item.values() if type(item) is dict else item
+            if kind is dict and not all(type(key) is str for key in item):
+                return False
+            children = item.values() if kind is dict else item
             stack.extend((child, depth + 1) for child in children)
+        elif kind is float:
+            if not _is_number(item):
+                return False
+        elif item is not None and kind not in (str, int, bool):
+            return False
     return True
 
 
@@ -132,7 +145,7 @@ def loads_strict(text: str) -> Any:
         return value
 
     value = json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
-    if not depth_ok(value):
+    if not json_value_ok(value):
         raise ValueError("nested too deeply")
     return value
 
@@ -510,8 +523,9 @@ def assess(claim: Any, receipts: list, *, check_current: Callable[[str, list[str
     reasons: list[str] = []
     matching: dict[str, dict] = {}
     for receipt in receipts:
-        # Depth first: hashing or printing a deeper value can exhaust the interpreter's stack.
-        if type(receipt) is not dict or not depth_ok(receipt):
+        # Checked before anything else touches it: hashing a value that is not JSON raises,
+        # and hashing or printing one nested too deeply can exhaust the interpreter's stack.
+        if type(receipt) is not dict or not json_value_ok(receipt):
             reasons.append("unreadable_receipt")
         elif not _is_str(receipt.get("run_id")):
             reasons.append("malformed_receipt")
