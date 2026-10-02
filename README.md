@@ -227,9 +227,10 @@ member and it proves nothing. `bind` takes no sentence, no transcript and no dir
 **Binding is not evidence.** A claim bound to a receipt always matches that receipt's identity,
 so binding cannot make a claim more true. It works the same for a run that failed, timed out or
 changed its declared files; what the run showed is decided by `report`. `bind` refuses (exit 64)
-only a receipt with no usable identity: not a JSON object, another schema, no run id, not exactly
-one well-formed selection, malformed declared files, or stored digests that contradict the
-content.
+only a receipt with no usable identity: not a JSON object, another schema, no run id, a report
+that does not hold exactly one well-formed session start with that same run id, not exactly one
+well-formed selection, malformed declared files, or stored digests that contradict the content.
+A session finish is not required.
 
 `report` runs the assessment once and prints it:
 

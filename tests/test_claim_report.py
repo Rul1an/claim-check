@@ -293,7 +293,8 @@ class TestBind(unittest.TestCase):
             out = ce.assess(claim, [receipt])
             self.assertEqual(out["verdict"], expected[name], name)
             # Whatever the verdict, a claim bound to a receipt never mismatches that receipt's scope.
-            for reason in ("selection_mismatch", "declared_files_mismatch", "no_receipt_for_run", "scope_unspecified"):
+            for reason in ("selection_mismatch", "declared_files_mismatch", "no_receipt_for_run", "scope_unspecified",
+                           "run_id_mismatch"):
                 self.assertNotIn(reason, out["reasons"], name)
 
     def test_a_bound_claim_does_not_travel_to_another_run(self):
@@ -359,6 +360,53 @@ class TestBind(unittest.TestCase):
         negative["declared_files"]["pre"][0]["size"] = -1
         negative["declared_files_digest"] = fx.sha([["src/a.py", fx.FILE_HASH, -1]])
         self.assert_refused(negative, "negative size, digest consistent")
+
+    def test_the_report_must_have_been_written_for_the_run_the_receipt_names(self):
+        """A receipt that names one run on the outside and another in its report has no single
+        run identity. Bound anyway, the claim came back `run_id_mismatch` from the checker."""
+        def start(r):
+            return r["report"]["events"][0]
+
+        def two_starts(r):
+            r["report"]["events"].insert(1, copy.deepcopy(start(r)))
+
+        def two_starts_disagreeing(r):
+            r["report"]["events"].insert(1, dict(start(r), run_id="another-run"))
+
+        refused = {
+            "report written for another run": lambda r: start(r).update(run_id="another-run"),
+            "no session start": lambda r: without(r, "session_start"),
+            "two session starts": two_starts,
+            "two session starts that disagree": two_starts_disagreeing,
+            "session start with a run id that is not a string": lambda r: start(r).update(run_id=7),
+            "session start with a member missing": lambda r: start(r).pop("pytest_version"),
+            "session start with an extra member": lambda r: start(r).update(hostname="h"),
+            "session start with no run id": lambda r: start(r).pop("run_id"),
+        }
+        accepted = []
+        for name, change in refused.items():
+            for base in (fx.passing_receipt, fx.failing_receipt):
+                receipt = base()
+                change(receipt)
+                try:
+                    cr.bind_claim("recorded_selection_passed", receipt)
+                except cr.BindError:
+                    continue
+                except Exception as exc:
+                    accepted.append("%s: raised %s" % (name, type(exc).__name__))
+                else:
+                    accepted.append(name)
+        self.assertEqual(accepted, [])
+
+    def test_a_run_with_a_session_start_and_no_session_finish_is_still_bound(self):
+        """Controls for the rule above: it asks for the start of the session, not for its end."""
+        timed_out = bindable_receipts()["timed out"]
+        self.assertEqual([e["event"] for e in timed_out["report"]["events"]], ["session_start", "selected"])
+        died = without(fx.failing_receipt(), "session_finish")
+        for receipt in (timed_out, died, fx.failing_receipt()):
+            claim = cr.bind_claim("recorded_selection_passed", receipt)
+            self.assertEqual(claim["run_id"], "run-0001")
+            self.assertNotIn("run_id_mismatch", ce.assess(claim, [receipt])["reasons"])
 
     def test_only_a_known_kind_can_be_bound(self):
         for kind in ("all_tests_pass", "", None, 7, ["recorded_selection_passed"]):

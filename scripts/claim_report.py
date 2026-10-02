@@ -11,7 +11,7 @@ receipt are named by whoever runs the command.
 
 bind copies the scope out of the receipt it is given: the run id, and the digests of
 the recorded selection and of the declared files, recomputed from the receipt's
-content. It is a way to say "this run, this selection" without computing digests by
+content. The receipt's report must have been started for that same run. It is a way to say "this run, this selection" without computing digests by
 hand. A claim bound this way always matches that receipt's identity, so binding adds
 no evidence, and it works just as well for a run that failed or never finished. What
 the run showed is decided only by `report` (or `claim_evidence.py assess`).
@@ -70,11 +70,12 @@ class BindError(Exception):
 def bind_claim(kind: Any, receipt: Any) -> dict:
     """A claim of `kind` scoped to the run, selection and declared files of `receipt`.
 
-    Checks identity only: that the receipt names one run, records exactly one
-    well-formed selection and well-formed declared files, and that the digests it
-    stores equal the ones recomputed here. It does not look at exit codes, phases or
-    whether the session finished: a failed or incomplete run can be bound, and the
-    assessment then says what that run showed.
+    Checks identity only: that the receipt names one run and its report was written
+    for that same run (exactly one well-formed session start carrying the same run
+    id), that it records exactly one well-formed selection and well-formed declared
+    files, and that the digests it stores equal the ones recomputed here. It does not
+    look at exit codes, phases or whether the session finished: a failed or
+    incomplete run can be bound, and the assessment then says what that run showed.
     """
     if type(kind) is not str or kind not in ce.KINDS:
         raise BindError("unknown claim kind")
@@ -90,6 +91,14 @@ def bind_claim(kind: Any, receipt: Any) -> dict:
     events = report.get("events") if type(report) is dict else None
     if type(events) is not list:
         raise BindError("the receipt holds no report events")
+    # One run identity: the report must have been started for the run the receipt names.
+    # The same structural rule the assessor applies to a session start, and the same
+    # comparison it makes; a session finish is not asked for.
+    starts = [e for e in events if type(e) is dict and e.get("event") == "session_start"]
+    if len(starts) != 1 or not ce._event_ok(starts[0]):
+        raise BindError("the report does not record exactly one well-formed session start")
+    if starts[0]["run_id"] != run_id:
+        raise BindError("the report was written for another run than the receipt names")
     selections = [e for e in events if type(e) is dict and e.get("event") == "selected"]
     # The same structural rule the assessor applies to a selection event.
     if len(selections) != 1 or not ce._event_ok(selections[0]):
