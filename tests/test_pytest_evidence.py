@@ -302,6 +302,108 @@ class TestDeclaredFiles(RunnerCase):
             self.assertEqual([f for f in os.listdir(self.receipts)] if os.path.isdir(self.receipts) else [], [], declare)
 
 
+class _FaultyWriter:
+    """Wraps the real file object the runner writes the receipt through, and fails once."""
+
+    def __init__(self, real, fail):
+        self.real, self.fail = real, fail
+
+    def write(self, text):
+        if self.fail == "write":
+            self.real.write(text[: len(text) // 2])
+            self.real.flush()
+            raise OSError(28, "No space left on device")
+        return self.real.write(text)
+
+    def flush(self):
+        return self.real.flush()
+
+    def fileno(self):
+        return self.real.fileno()
+
+    def close(self):
+        self.real.close()
+        if self.fail == "close":
+            raise OSError(5, "Input/output error")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class TestReceiptPublication(RunnerCase):
+    """The final name `<run_id>.json` must never show a receipt that was not fully written.
+
+    Runs the runner's own `run()` in this process, with a real pytest child, and injects
+    one failure into the write of the receipt.
+    """
+
+    def run_in_process(self, *patches):
+        import contextlib
+        import io
+        from unittest import mock
+        import pytest_evidence as pe
+        self.write("test_ok.py", PASSING)
+        out, old = io.StringIO(), os.getcwd()
+        os.chdir(self.cwd)
+        try:
+            with contextlib.ExitStack() as stack:
+                for target, name, kwargs in patches:
+                    stack.enter_context(mock.patch.object(getattr(pe, target), name, **kwargs))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                code = pe.run(self.receipts, ["src/calc.py"], ["-q", "-p", "no:cacheprovider", "test_ok.py"],
+                              60.0, 0, 10 ** 6)
+        finally:
+            os.chdir(old)
+        return code, out.getvalue()
+
+    def entries(self):
+        return sorted(os.listdir(self.receipts)) if os.path.isdir(self.receipts) else []
+
+    def faulty(self, fail):
+        real = os.fdopen
+
+        def fdopen(fd, mode="r", *a, **k):
+            handle = real(fd, mode, *a, **k)
+            # Only the receipt is opened for writing; declared files are opened for reading.
+            return _FaultyWriter(handle, fail) if "w" in mode else handle
+        return ("os", "fdopen", {"side_effect": fdopen})
+
+    def test_a_write_that_stops_halfway_leaves_no_receipt_under_any_name(self):
+        code, out = self.run_in_process(self.faulty("write"))
+        self.assertEqual((code, out, self.entries()), (70, "", []))
+
+    def test_a_failing_close_leaves_no_receipt_under_any_name(self):
+        code, out = self.run_in_process(self.faulty("close"))
+        self.assertEqual((code, out, self.entries()), (70, "", []))
+
+    def test_a_failing_fsync_leaves_no_receipt_under_any_name(self):
+        code, out = self.run_in_process(("os", "fsync", {"side_effect": OSError(5, "Input/output error")}))
+        self.assertEqual((code, out, self.entries()), (70, "", []))
+
+    def test_an_existing_receipt_with_the_same_name_is_not_overwritten(self):
+        run_id = "a" * 32
+        os.mkdir(self.receipts, 0o700)
+        existing = os.path.join(self.receipts, run_id + ".json")
+        with open(existing, "wb") as fh:
+            fh.write(b"older receipt bytes")
+        code, out = self.run_in_process(("secrets", "token_hex", {"return_value": run_id}))
+        self.assertEqual((code, out, self.entries()), (70, "", [run_id + ".json"]))
+        with open(existing, "rb") as fh:
+            self.assertEqual(fh.read(), b"older receipt bytes")
+
+    def test_without_a_fault_the_same_path_publishes_one_complete_private_receipt(self):
+        code, out = self.run_in_process()
+        summary = json.loads(out)
+        self.assertEqual((code, self.entries()), (0, [summary["run_id"] + ".json"]))
+        self.assertEqual(stat.S_IMODE(os.stat(summary["receipt"]).st_mode), 0o600)
+        with open(summary["receipt"], encoding="utf-8") as fh:
+            self.assertEqual(ce.loads_strict(fh.read())["run_id"], summary["run_id"])
+
+
 class TestReceiptFile(RunnerCase):
     def test_receipt_is_private_and_holds_no_output_and_no_environment_values(self):
         self.write("test_loud.py", "def test_loud():\n    print('canary-output')\n    assert True\n")

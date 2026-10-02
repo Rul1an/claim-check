@@ -130,6 +130,42 @@ def _read_report(path, max_bytes):
     return {"present": True, "truncated": False, "malformed_lines": malformed, "events": events}
 
 
+def _publish(receipt_dir, run_id, text):
+    """Write the receipt so that `<run_id>.json` is either absent or complete.
+
+    The bytes go to a temporary file in the same directory (mode 0600), which is
+    flushed, fsynced and closed before the final name is created with a hard link. A
+    link is atomic and fails when the name exists, so a partial receipt is never
+    visible under the final name and an existing receipt is never replaced. The
+    temporary file is removed whatever happens.
+
+    This is about what a reader can see. It is not a promise about power loss: the
+    directory itself is not fsynced, so a crash right after this returns can still
+    lose the new name. Raises OSError.
+    """
+    final = os.path.join(receipt_dir, run_id + ".json")
+    fd, tmp = tempfile.mkstemp(prefix=".receipt-", suffix=".tmp", dir=receipt_dir)
+    try:
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        finally:
+            fh.close()
+        os.link(tmp, final)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return final
+
+
 def _kill(proc):
     try:
         if hasattr(os, "killpg"):
@@ -236,18 +272,15 @@ def run(receipt_dir, declare, pytest_args, timeout, max_output_bytes, max_report
         "declared_files_digest": ce.digest_declared(pre),
     }
 
-    path = os.path.join(receipt_dir, run_id + ".json")
     try:
-        # Serialised in full before the file exists, so a failure leaves no partial receipt.
+        # Serialised in full first, so a value that cannot be serialised touches no file.
         # allow_nan=False: `Infinity` and `NaN` are not JSON, and the checker refuses them.
         text = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n"
     except (ValueError, RecursionError):
         sys.stderr.write("cannot serialise the receipt\n")
         return EXIT_INTERNAL
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        path = _publish(receipt_dir, run_id, text)
     except OSError as exc:
         sys.stderr.write(f"cannot write the receipt: {exc.strerror}\n")
         return EXIT_INTERNAL
