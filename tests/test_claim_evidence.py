@@ -374,7 +374,10 @@ class TestReceiptSets(unittest.TestCase):
             bad_receipts.append(r)
         for bad in bad_receipts:
             for receipts in ([bad], [passing_receipt(), bad], [bad, passing_receipt()]):
-                out = ce.assess(claim(), receipts)
+                try:
+                    out = ce.assess(claim(), receipts)
+                except Exception as exc:  # the defect was an exception; it must fail here, not error
+                    self.fail("assess() raised %s for %r" % (type(exc).__name__, bad.get("extra", bad.get("nested"))))
                 self.assertEqual((out["verdict"], out["reasons"]), ("insufficient", ["unreadable_receipt"]),
                                  repr(bad.get("extra", bad.get("nested"))))
 
