@@ -414,6 +414,16 @@ class TestEventFields(unittest.TestCase):
         for change in (start_after_selection, start_after_a_deselection, finish_before_the_last_phase):
             self.assertEqual(self.reasons(change), ["report_out_of_order"], change.__name__)
 
+    def test_a_report_without_its_start_selection_or_finish_names_what_is_missing(self):
+        """Each on its own, with nothing else wrong, so the reason is the missing event and not
+        a later check or a crash."""
+        self.assertEqual(self.reasons(lambda r: events_of(r).pop(0)), ["report_not_started"])
+        self.assertEqual(self.reasons(lambda r: events_of(r).pop()), ["report_not_finished"])
+
+        def no_selection(r):
+            r["report"]["events"] = [events_of(r)[0], events_of(r)[-1]]
+        self.assertEqual(self.reasons(no_selection), ["selection_not_recorded"])
+
     def test_a_phase_without_its_setup_is_out_of_order(self):
         def teardown_only(r):
             ev = events_of(r)
